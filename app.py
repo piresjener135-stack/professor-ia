@@ -2,6 +2,7 @@
 Professor IA - Engenharia e Matematica (v14-streamlit)
 - Compativel com Streamlit Cloud (interface Streamlit, sem Gradio)
 - Chave mestra (st.secrets) so inicializa a sessao; o processamento exige a chave PROPRIA do usuario, validada
+- Modelo Gemini escolhido dinamicamente ao testar a chave (st.session_state['modelo_ativo']) com fallback automatico
 - Leitura VISUAL do PDF: somente a pagina em foco e renderizada (cache LRU)
 - PDF dividido em 4 aulas progressivas e dependentes
 - TTS didatico (edge-tts): roteiro falado como professor na lousa
@@ -115,10 +116,9 @@ PROMPT_RESUMO = (
 @st.cache_resource
 def _caches() -> dict:
     """Caches globais que sobrevivem aos reruns do Streamlit."""
-    return {"modelo": {}, "paginas": OrderedDict()}
+    return {"paginas": OrderedDict()}
 
 
-_cache_modelo_gemini: dict = _caches()["modelo"]
 _cache_paginas_visual: "OrderedDict[tuple, list]" = _caches()["paginas"]
 
 
@@ -134,11 +134,57 @@ def chave_padrao() -> str:
 # ============================================================================
 # MOTOR DE IA - Gemini
 # ============================================================================
-def detectar_modelo_gemini(api_key: str) -> str:
-    """Lista os modelos e escolhe o melhor 'flash' estavel para a chave."""
-    if api_key in _cache_modelo_gemini:
-        return _cache_modelo_gemini[api_key]
-    escolhido = "gemini-2.0-flash"
+# Lista prioritaria de modelos. O primeiro que responder na validacao da chave vira o
+# st.session_state["modelo_ativo"]; os demais servem de fallback automatico durante as aulas.
+MODELOS_PRIORITARIOS = [
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+    "gemini-2.0-flash-exp",
+    "gemini-1.0-pro",
+]
+MAX_MODELOS_TENTADOS = 6
+
+
+def _classificar_http(r) -> str:
+    """Traduz a resposta HTTP em um tipo de erro: chave | cota | modelo | http."""
+    try:
+        corpo = r.text[:500]
+    except Exception:
+        corpo = ""
+    if r.status_code == 401:
+        return "chave"
+    if r.status_code in (400, 403) and ("API_KEY_INVALID" in corpo or "API key" in corpo):
+        return "chave"
+    if r.status_code == 429:
+        return "cota"
+    if r.status_code == 404:
+        return "modelo"
+    return "http"
+
+
+def _pontuar_modelo(nome):
+    """Pontuacao para modelos extras descobertos na API (None = descartar)."""
+    if not nome.startswith("gemini"):
+        return None
+    if any(x in nome for x in ("embedding", "tts", "image", "vision", "live", "audio", "robotics", "aqa")):
+        return None
+    pontos = 0.0
+    if "flash" in nome:
+        pontos += 10
+    if "lite" in nome:
+        pontos -= 3
+    if any(x in nome for x in ("preview", "exp", "thinking")):
+        pontos -= 5
+    if "latest" in nome:
+        pontos += 2
+    v = re.search(r"gemini-(\d+(?:\.\d+)?)", nome)
+    if v:
+        pontos += float(v.group(1))
+    return pontos
+
+
+def listar_modelos_api(api_key):
+    """Retorna (nomes_com_generateContent | None, erro). None = nao foi possivel listar."""
     try:
         r = requests.get(
             f"{GEMINI_BASE}/models",
@@ -146,50 +192,86 @@ def detectar_modelo_gemini(api_key: str) -> str:
             params={"pageSize": 100},
             timeout=15,
         )
-        r.raise_for_status()
-        candidatos = []
-        for m in r.json().get("models", []):
-            nome = m.get("name", "").replace("models/", "")
-            if "generateContent" not in m.get("supportedGenerationMethods", []):
-                continue
-            if not nome.startswith("gemini"):
-                continue
-            if any(x in nome for x in ("embedding", "tts", "image", "vision", "live", "audio", "robotics")):
-                continue
-            pontos = 0.0
-            if "flash" in nome:
-                pontos += 10
-            if "lite" in nome:
-                pontos -= 3
-            if any(x in nome for x in ("preview", "exp", "thinking")):
-                pontos -= 5
-            if "latest" in nome:
-                pontos += 2
-            v = re.search(r"gemini-(\d+(?:\.\d+)?)", nome)
-            if v:
-                pontos += float(v.group(1))
-            candidatos.append((pontos, nome))
-        if candidatos:
-            escolhido = max(candidatos)[1]
-    except Exception as e:
-        print(f"[Gemini] Não foi possível listar modelos ({e}); usando {escolhido}.")
-    _cache_modelo_gemini[api_key] = escolhido
-    print(f"[Gemini] Modelo em uso: {escolhido}")
-    return escolhido
+    except requests.RequestException as e:
+        print(f"[Gemini] não foi possível listar modelos: {e}")
+        return None, "rede"
+    if r.status_code != 200:
+        erro = _classificar_http(r)
+        print(f"[Gemini] listagem de modelos falhou: HTTP {r.status_code} ({erro})")
+        return None, erro
+    nomes = []
+    for m in r.json().get("models", []):
+        nome = m.get("name", "").replace("models/", "")
+        if "generateContent" in m.get("supportedGenerationMethods", []):
+            nomes.append(nome)
+    return nomes, ""
+
+
+def montar_lista_modelos(api_key):
+    """
+    Ordem de tentativa: modelos prioritarios que a chave realmente enxerga, depois outros
+    modelos de texto descobertos na API. Se a listagem falhar, usa a lista prioritaria.
+    Retorna (lista, erro).
+    """
+    disponiveis, erro = listar_modelos_api(api_key)
+    if erro == "chave":
+        return [], "chave"
+    if disponiveis is None:
+        return list(MODELOS_PRIORITARIOS), ""
+    prioridade = [m for m in MODELOS_PRIORITARIOS if m in disponiveis]
+    extras = [m for m in disponiveis if m not in prioridade and _pontuar_modelo(m) is not None]
+    extras.sort(key=_pontuar_modelo, reverse=True)
+    lista = (prioridade + extras)[:MAX_MODELOS_TENTADOS]
+    return lista or list(MODELOS_PRIORITARIOS), ""
+
+
+def _chamar_modelo(modelo, payload, api_key, timeout):
+    """Uma chamada generateContent. Retorna (texto, erro): ('...', '') em sucesso."""
+    url = f"{GEMINI_BASE}/models/{modelo}:generateContent"
+    t0 = time.perf_counter()
+    try:
+        r = requests.post(
+            url,
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+            json=payload,
+            timeout=timeout,
+        )
+        if r.status_code != 200:
+            erro = _classificar_http(r)
+            print(f"[Gemini] {modelo}: HTTP {r.status_code} ({erro}) {r.text[:200]}")
+            return None, erro
+        print(f"[TEMPO] {modelo} respondeu em {time.perf_counter() - t0:.1f}s")
+        res_json = r.json()
+        if not (res_json.get("candidates") and res_json["candidates"][0].get("content")):
+            return None, "vazio"
+        partes = res_json["candidates"][0]["content"].get("parts", [])
+        texto = "".join(p.get("text", "") for p in partes).strip()
+        return (texto, "") if texto else (None, "vazio")
+    except requests.Timeout as e:
+        print(f"[Gemini] {modelo}: timeout: {e}")
+        return None, "timeout"
+    except requests.RequestException as e:
+        print(f"[Gemini] {modelo}: erro de rede: {e}")
+        return None, "rede"
+    except (KeyError, IndexError, ValueError) as e:
+        print(f"[Gemini] {modelo}: resposta inesperada/bloqueada: {e}")
+        return None, "vazio"
 
 
 def chamar_gemini(pergunta, contexto, historico, api_key, anexos=None):
     """
-    Chama o Gemini, opcionalmente com anexos visuais.
-    Retorna SEMPRE uma tupla (texto, tipo_de_erro):
-      (str, "")          -> sucesso
-      (None, "vazio")    -> resposta bloqueada ou sem texto
-      (None, "http")     -> erro HTTP (401, 403, 429, 500...)
-      (None, "timeout")  -> demorou demais
-      (None, "rede")     -> erro de conexao
+    Usa st.session_state['modelo_ativo'] e, se ele falhar, tenta automaticamente os proximos
+    modelos da lista de fallback antes de desistir.
+    Retorna SEMPRE (texto, tipo_de_erro):
+      (str, "")  -> sucesso
+      (None, e)  -> e em: chave | cota | modelo | http | timeout | rede | vazio
     """
-    modelo = detectar_modelo_gemini(api_key)
-    url = f"{GEMINI_BASE}/models/{modelo}:generateContent"
+    ss = st.session_state
+    ativo = ss.get("modelo_ativo")
+    lista = list(ss.get("modelos_fallback") or MODELOS_PRIORITARIOS)
+    ordem = ([ativo] if ativo else []) + [m for m in lista if m != ativo]
+    ordem = ordem[:MAX_MODELOS_TENTADOS]
+
     contents = []
     for msg in historico[-MAX_MENSAGENS_HISTORICO:]:
         role = "user" if msg["role"] == "user" else "model"
@@ -211,41 +293,20 @@ def chamar_gemini(pergunta, contexto, historico, api_key, anexos=None):
         "systemInstruction": {"parts": [{"text": PROMPT_SISTEMA}]},
         "contents": contents,
     }
-    t0 = time.perf_counter()
-    try:
-        r = requests.post(
-            url,
-            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-            json=payload,
-            timeout=60 if anexos else 45,
-        )
-        if r.status_code == 404:
-            _cache_modelo_gemini.pop(api_key, None)
-        r.raise_for_status()
-        print(f"[TEMPO] Gemini respondeu em {time.perf_counter() - t0:.1f}s")
-        res_json = r.json()
-        if not (res_json.get("candidates") and res_json["candidates"][0].get("content")):
-            return None, "vazio"
-        partes = res_json["candidates"][0]["content"].get("parts", [])
-        texto = "".join(p.get("text", "") for p in partes).strip()
-        return (texto, "") if texto else (None, "vazio")
-    except requests.Timeout as e:
-        print(f"[Gemini] timeout: {e}")
-        return None, "timeout"
-    except requests.HTTPError as e:
-        corpo = ""
-        try:
-            corpo = e.response.text[:300]
-        except Exception:
-            pass
-        print(f"[Gemini] erro HTTP: {e} {corpo}")
-        return None, "http"
-    except requests.RequestException as e:
-        print(f"[Gemini] erro de rede: {e}")
-        return None, "rede"
-    except (KeyError, IndexError, ValueError) as e:
-        print(f"[Gemini] resposta inesperada/bloqueada: {e}")
-        return None, "vazio"
+
+    ultimo_erro = "vazio"
+    for modelo in ordem:
+        texto, erro = _chamar_modelo(modelo, payload, api_key, 60 if anexos else 45)
+        if texto:
+            if modelo != ativo:
+                print(f"[Gemini] fallback: '{modelo}' passou a ser o modelo ativo.")
+                ss["modelo_ativo"] = modelo
+            return texto, ""
+        ultimo_erro = erro
+        if erro == "chave":
+            return None, "chave"  # chave invalida: trocar de modelo nao adianta
+        print(f"[Gemini] '{modelo}' falhou ({erro}); tentando o próximo modelo...")
+    return None, ultimo_erro
 
 
 def motor_hibrido(pergunta, estado, historico, api_key, usar_visual=True):
@@ -281,16 +342,22 @@ def motor_hibrido(pergunta, estado, historico, api_key, usar_visual=True):
     if resultado:
         return resultado, True, " ".join(notas)
 
-    if erro == "timeout":
-        return ("⚠️ O Gemini demorou demais para responder. Tente novamente — ou desmarque "
-                "'leitura visual' para acelerar.", False, "")
-    if erro == "http":
-        return ("⚠️ A API do Gemini respondeu com erro. Verifique se a chave está correta e se a "
-                "cota não foi excedida.", False, "")
-    if erro == "rede":
-        return ("⚠️ Não consegui falar com a API do Gemini. Verifique a conexão.", False, "")
-    return ("⚠️ Não consegui obter a resposta do Gemini. Tente novamente em alguns segundos.",
-            False, "")
+    mensagens = {
+        "chave": "⚠️ A API recusou a chave informada. Gere/valide a chave novamente com **Testar Chave**.",
+        "cota": ("⚠️ A cota da sua chave foi excedida em todos os modelos testados. "
+                 "Aguarde um pouco ou use outra chave."),
+        "modelo": ("⚠️ Nenhum dos modelos da lista está disponível para esta chave. "
+                   "Clique em **Testar Chave** para reavaliar os modelos."),
+        "timeout": ("⚠️ O Gemini demorou demais para responder. Tente novamente — ou desmarque "
+                    "'leitura visual' para acelerar."),
+        "http": "⚠️ A API do Gemini respondeu com erro em todos os modelos tentados. Tente novamente.",
+        "rede": "⚠️ Não consegui falar com a API do Gemini. Verifique a conexão.",
+    }
+    return (
+        mensagens.get(erro, "⚠️ Não consegui obter a resposta do Gemini. Tente novamente em alguns segundos."),
+        False,
+        "",
+    )
 
 
 # ============================================================================
@@ -328,8 +395,47 @@ def indicador_neutro() -> str:
     )
 
 
+def _gerar_teste(modelo, api_key):
+    """Teste real de geracao num modelo. Retorna '' se respondeu; senao o tipo de erro."""
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": "Responda apenas com a palavra: ok"}]}],
+        "generationConfig": {"maxOutputTokens": 32},
+    }
+    try:
+        r = requests.post(
+            f"{GEMINI_BASE}/models/{modelo}:generateContent",
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+            json=payload,
+            timeout=20,
+        )
+    except requests.Timeout:
+        return "timeout"
+    except requests.RequestException:
+        return "rede"
+    if r.status_code == 200:
+        return ""
+    return _classificar_http(r)
+
+
+_ROTULO_ERRO = {
+    "chave": "a API recusou a chave",
+    "cota": "cota excedida",
+    "modelo": "modelo indisponível",
+    "timeout": "tempo esgotado",
+    "rede": "sem conexão",
+    "http": "erro da API",
+}
+
+
 def testar_chave_gemini(api_key):
-    """Valida a chave do USUARIO. Retorna (html_indicador, valida: bool)."""
+    """
+    Valida a chave do USUARIO testando a geracao de conteudo em cada modelo da lista.
+    O primeiro que responder vira st.session_state['modelo_ativo'].
+    Retorna (html_indicador, valida: bool).
+    """
+    ss = st.session_state
+    ss["modelo_ativo"] = None
+    ss["modelos_fallback"] = []
     api_key = (api_key or "").strip()
     if not api_key:
         return _indicador_html("cinza", "⚪ Cole uma chave para testar"), False
@@ -340,27 +446,29 @@ def testar_chave_gemini(api_key):
             "🔴 Esta é a chave mestra do app",
             "Use a sua própria chave para consumir o processamento.",
         ), False
-    try:
-        r = requests.get(
-            f"{GEMINI_BASE}/models",
-            headers={"x-goog-api-key": api_key},
-            params={"pageSize": 1},
-            timeout=10,
-        )
-    except requests.RequestException as e:
-        return _indicador_html("vermelho", "🔴 Chave inválida / erro de conexão",
-                               f"Sem conexão: {type(e).__name__}"), False
-    if r.status_code == 200:
-        _cache_modelo_gemini.pop(api_key, None)
-        modelo = detectar_modelo_gemini(api_key)
-        return _indicador_html("verde", "🟢 Chave Gemini VÁLIDA e conectada!",
-                               f"Modelo que será usado: {modelo}"), True
-    try:
-        msg = r.json().get("error", {}).get("message", "")
-    except ValueError:
-        msg = ""
-    detalhe = f"HTTP {r.status_code}" + (f" — {msg[:120]}" if msg else "")
-    return _indicador_html("vermelho", "🔴 Chave inválida / erro de conexão", detalhe), False
+
+    candidatos, erro = montar_lista_modelos(api_key)
+    if erro == "chave":
+        return _indicador_html("vermelho", "🔴 Chave inválida", "A API do Google recusou esta chave."), False
+
+    falhas = []
+    for modelo in candidatos:
+        erro = _gerar_teste(modelo, api_key)
+        if not erro:
+            ss["modelo_ativo"] = modelo
+            ss["modelos_fallback"] = candidatos
+            print(f"[Gemini] modelo ativo: {modelo}")
+            return _indicador_html(
+                "verde",
+                "🟢 Chave Gemini VÁLIDA e conectada!",
+                f"Modelo ativo: {modelo}",
+            ), True
+        if erro == "chave":
+            return _indicador_html("vermelho", "🔴 Chave inválida", "A API do Google recusou esta chave."), False
+        falhas.append(f"{modelo}: {_ROTULO_ERRO.get(erro, erro)}")
+
+    detalhe = "Nenhum modelo respondeu. " + "; ".join(falhas[:4]) if falhas else "Nenhum modelo disponível."
+    return _indicador_html("vermelho", "🔴 Nenhum modelo respondeu com esta chave", detalhe), False
 
 
 # ============================================================================
@@ -1221,6 +1329,8 @@ def inicializar_sessao():
     # Chave mestra: carregada em silencio so para a sessao abrir; NUNCA usada no processamento.
     st.session_state.setdefault("chave_mestra", chave_padrao())
     st.session_state.setdefault("chave_validada", "")
+    st.session_state.setdefault("modelo_ativo", None)
+    st.session_state.setdefault("modelos_fallback", [])
 
 
 def _guardar_audio(caminho):
@@ -1240,6 +1350,8 @@ def _invalidar_chave():
     """Ao editar a caixinha, a validacao anterior deixa de valer."""
     st.session_state["indicador"] = None
     st.session_state["chave_validada"] = ""
+    st.session_state["modelo_ativo"] = None
+    st.session_state["modelos_fallback"] = []
 
 
 def chave_propria_valida(chave: str) -> bool:
