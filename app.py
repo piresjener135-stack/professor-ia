@@ -1,7 +1,7 @@
 """
 Professor IA - Engenharia e Matematica (v14-streamlit)
 - Compativel com Streamlit Cloud (interface Streamlit, sem Gradio)
-- Somente Gemini na nuvem; chave lida de st.secrets / variavel de ambiente GEMINI_API_KEY
+- Chave mestra (st.secrets) so inicializa a sessao; o processamento exige a chave PROPRIA do usuario, validada
 - Leitura VISUAL do PDF: somente a pagina em foco e renderizada (cache LRU)
 - PDF dividido em 4 aulas progressivas e dependentes
 - TTS didatico (edge-tts): roteiro falado como professor na lousa
@@ -251,14 +251,11 @@ def chamar_gemini(pergunta, contexto, historico, api_key, anexos=None):
 def motor_hibrido(pergunta, estado, historico, api_key, usar_visual=True):
     """Usa SOMENTE Gemini. Retorna (texto, ok, nota)."""
     notas = []
-    chave = (api_key or chave_padrao()).strip()
+    chave = (api_key or "").strip()
     if not chave:
         return (
-            "⚠️ **Nenhuma chave do Gemini configurada.**\n\n"
-            "**Como resolver:**\n"
-            "- No Streamlit Cloud: abra *Settings → Secrets* e adicione "
-            "`GEMINI_API_KEY = \"sua-chave\"`.\n"
-            "- Ou cole a chave no campo da barra lateral.\n\n"
+            "🔒 **Informe e valide a sua própria chave do Gemini.**\n\n"
+            "Cole a chave no campo da barra lateral e clique em **Testar Chave**. "
             "Obtenha uma chave grátis em: https://aistudio.google.com/app/apikey",
             False,
             "",
@@ -318,23 +315,31 @@ def _indicador_html(cor, texto, detalhe=""):
 
 
 def indicador_neutro() -> str:
-    if chave_padrao():
+    if st.session_state.get("chave_mestra"):
         return _indicador_html(
-            "verde",
-            "🟢 Chave configurada nos Secrets",
-            "Você também pode colar outra chave acima para substituir temporariamente.",
+            "cinza",
+            "🔒 Chave mestra carregada (uso restrito)",
+            "Ela só mantém o app aberto. Para usar o professor, insira e valide a sua própria chave.",
         )
     return _indicador_html(
         "cinza",
-        "⚪ Nenhuma chave configurada",
-        "Cole a chave acima ou defina GEMINI_API_KEY nos Secrets do app.",
+        "⚪ Nenhuma chave informada",
+        "Cole a sua chave acima e clique em Testar Chave.",
     )
 
 
 def testar_chave_gemini(api_key):
-    api_key = (api_key or chave_padrao()).strip()
+    """Valida a chave do USUARIO. Retorna (html_indicador, valida: bool)."""
+    api_key = (api_key or "").strip()
     if not api_key:
-        return _indicador_html("cinza", "⚪ Cole uma chave para testar")
+        return _indicador_html("cinza", "⚪ Cole uma chave para testar"), False
+    mestra = chave_padrao()
+    if mestra and api_key == mestra:
+        return _indicador_html(
+            "vermelho",
+            "🔴 Esta é a chave mestra do app",
+            "Use a sua própria chave para consumir o processamento.",
+        ), False
     try:
         r = requests.get(
             f"{GEMINI_BASE}/models",
@@ -344,18 +349,18 @@ def testar_chave_gemini(api_key):
         )
     except requests.RequestException as e:
         return _indicador_html("vermelho", "🔴 Chave inválida / erro de conexão",
-                               f"Sem conexão: {type(e).__name__}")
+                               f"Sem conexão: {type(e).__name__}"), False
     if r.status_code == 200:
         _cache_modelo_gemini.pop(api_key, None)
         modelo = detectar_modelo_gemini(api_key)
         return _indicador_html("verde", "🟢 Chave Gemini VÁLIDA e conectada!",
-                               f"Modelo que será usado: {modelo}")
+                               f"Modelo que será usado: {modelo}"), True
     try:
         msg = r.json().get("error", {}).get("message", "")
     except ValueError:
         msg = ""
     detalhe = f"HTTP {r.status_code}" + (f" — {msg[:120]}" if msg else "")
-    return _indicador_html("vermelho", "🔴 Chave inválida / erro de conexão", detalhe)
+    return _indicador_html("vermelho", "🔴 Chave inválida / erro de conexão", detalhe), False
 
 
 # ============================================================================
@@ -1065,12 +1070,128 @@ def acao_reiniciar_curso(historico, estado):
 # ============================================================================
 CSS = """
 <style>
-html, body, [data-testid="stAppViewContainer"], [data-testid="stSidebar"] {
+:root {
+    color-scheme: dark;
+    --gelo-1: #1e2530;
+    --gelo-2: #263238;
+    --gelo-borda: #4a5a66;
+    --texto: #e6eef3;
+    --texto-suave: #b8c7d1;
+    --vinho: #7a2441;
+    --vinho-hover: #a8325a;
+    --vinho-ativo: #5c1229;
+}
+html, body, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
     background-color: #0b1210 !important;
-    color: #e5f5ec;
+    color: var(--texto);
+}
+[data-testid="stSidebar"], [data-testid="stSidebar"] > div:first-child {
+    background-color: #121a20 !important;
+    border-right: 1px solid #2a3640;
 }
 footer { visibility: hidden; }
-/* Quadro negro: mensagens do chat */
+
+/* ---------- Rotulos e textos legiveis ---------- */
+label, label p, label span,
+[data-testid="stWidgetLabel"], [data-testid="stWidgetLabel"] p,
+[data-testid="stCheckbox"] label, [data-testid="stCheckbox"] p,
+[data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li,
+[data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3,
+[data-testid="stSpinner"] * {
+    color: var(--texto) !important;
+}
+[data-testid="stCaptionContainer"], small, [data-testid="stSidebar"] small {
+    color: var(--texto-suave) !important;
+}
+[data-testid="stTooltipIcon"] svg { color: var(--texto-suave) !important; }
+
+/* ---------- Inputs, selects e textareas (gelo escuro) ---------- */
+[data-baseweb="input"], [data-baseweb="textarea"], [data-baseweb="select"] > div {
+    background-color: var(--gelo-1) !important;
+    border: 1px solid var(--gelo-borda) !important;
+    border-radius: 8px !important;
+}
+[data-baseweb="base-input"], [data-baseweb="base-input"] input,
+[data-testid="stSidebar"] input, [data-testid="stSidebar"] textarea {
+    background-color: var(--gelo-1) !important;
+    color: var(--texto) !important;
+    -webkit-text-fill-color: var(--texto) !important;
+    caret-color: #ffffff;
+}
+input::placeholder, textarea::placeholder {
+    color: #93a4af !important;
+    -webkit-text-fill-color: #93a4af !important;
+    opacity: 1 !important;
+}
+[data-baseweb="input"]:focus-within, [data-baseweb="textarea"]:focus-within {
+    border-color: var(--vinho-hover) !important;
+    box-shadow: 0 0 0 1px var(--vinho-hover) !important;
+}
+
+/* ---------- Upload de arquivo ---------- */
+[data-testid="stFileUploaderDropzone"] {
+    background-color: var(--gelo-1) !important;
+    border: 1px dashed var(--gelo-borda) !important;
+    border-radius: 10px !important;
+}
+[data-testid="stFileUploaderDropzone"] *, [data-testid="stFileUploaderFile"] * {
+    color: #c9d6de !important;
+}
+
+/* ---------- Caixas de selecao ---------- */
+[data-testid="stCheckbox"] label { color: var(--texto) !important; }
+
+/* ---------- Campo de chat ---------- */
+[data-testid="stBottom"], [data-testid="stBottom"] > div { background-color: #0b1210 !important; }
+[data-testid="stChatInput"], [data-testid="stChatInput"] > div {
+    background-color: var(--gelo-1) !important;
+    border-radius: 12px !important;
+}
+[data-testid="stChatInput"] textarea {
+    background-color: var(--gelo-1) !important;
+    color: var(--texto) !important;
+    -webkit-text-fill-color: var(--texto) !important;
+}
+
+/* ---------- Botoes: gelo escuro; vinho ao passar o mouse / clicar ---------- */
+.stButton > button, [data-testid="stFileUploaderDropzone"] button {
+    background-color: var(--gelo-2) !important;
+    color: var(--texto) !important;
+    border: 1px solid var(--gelo-borda) !important;
+    border-radius: 8px !important;
+    transition: background-color .15s ease, border-color .15s ease, transform .05s ease;
+}
+.stButton > button p, .stButton > button span { color: inherit !important; }
+.stButton > button[kind="primary"], .stButton > button[data-testid="stBaseButton-primary"] {
+    background-color: var(--vinho) !important;
+    border-color: var(--vinho-hover) !important;
+    color: #ffffff !important;
+}
+.stButton > button:hover, [data-testid="stFileUploaderDropzone"] button:hover {
+    background-color: var(--vinho-hover) !important;
+    border-color: #d65b84 !important;
+    color: #ffffff !important;
+}
+.stButton > button:active, .stButton > button:focus:not(:active),
+[data-testid="stFileUploaderDropzone"] button:active {
+    background-color: var(--vinho-ativo) !important;
+    border-color: #d65b84 !important;
+    color: #ffffff !important;
+    transform: scale(0.98);
+}
+/* botao do "olho" do campo de senha: sem fundo de botao */
+[data-baseweb="input"] button, [data-baseweb="input"] button:hover {
+    background-color: transparent !important;
+    border: none !important;
+    color: var(--texto-suave) !important;
+}
+[data-baseweb="input"] svg { fill: var(--texto-suave) !important; color: var(--texto-suave) !important; }
+
+/* ---------- Alertas ---------- */
+[data-testid="stAlert"] { border-radius: 10px !important; }
+[data-testid="stAlert"] * { color: #f6eef1 !important; }
+
+/* ---------- Quadro negro: mensagens do chat ---------- */
 [data-testid="stChatMessage"] {
     background: #0f3b25 !important;
     border: 3px solid #8b5a2b;
@@ -1097,12 +1218,34 @@ def inicializar_sessao():
     st.session_state.setdefault("indicador", None)
     st.session_state.setdefault("pdf_id", None)
     st.session_state.setdefault("aviso_pdf", "")
+    # Chave mestra: carregada em silencio so para a sessao abrir; NUNCA usada no processamento.
+    st.session_state.setdefault("chave_mestra", chave_padrao())
+    st.session_state.setdefault("chave_validada", "")
 
 
 def _guardar_audio(caminho):
     if caminho:
         st.session_state["audio_atual"] = caminho
         st.session_state["audio_tocar"] = True
+
+
+MSG_CHAVE_OBRIGATORIA = (
+    "🔒 Para consumir o processamento, insira **a sua própria chave** do Gemini na barra lateral "
+    "e clique em **Testar Chave** até ela ser validada. A chave mestra do app não é usada "
+    "nesta operação."
+)
+
+
+def _invalidar_chave():
+    """Ao editar a caixinha, a validacao anterior deixa de valer."""
+    st.session_state["indicador"] = None
+    st.session_state["chave_validada"] = ""
+
+
+def chave_propria_valida(chave: str) -> bool:
+    """True somente se o usuario digitou uma chave E ela foi validada pelo botao Testar Chave."""
+    chave = (chave or "").strip()
+    return bool(chave) and chave == st.session_state.get("chave_validada", "")
 
 
 def main():
@@ -1119,13 +1262,17 @@ def main():
     # ---------------- Barra lateral ----------------
     with st.sidebar:
         chave = st.text_input(
-            "🔒 Chave de API do Gemini (opcional se definida nos Secrets)",
+            "🔒 Chave API do Gemini (sua chave pessoal)",
             type="password",
             placeholder="Cole sua API Key aqui...",
+            key="chave_usuario",
+            on_change=_invalidar_chave,
         )
         if st.button("🔑 Testar Chave", use_container_width=True):
             with st.spinner("Testando chave..."):
-                ss["indicador"] = testar_chave_gemini(chave)
+                html_ind, valida = testar_chave_gemini(chave)
+            ss["indicador"] = html_ind
+            ss["chave_validada"] = chave.strip() if valida else ""
         st.markdown(ss["indicador"] or indicador_neutro(), unsafe_allow_html=True)
 
         arquivo = st.file_uploader("Biblioteca (upload de PDF de aula/livro)", type=["pdf"])
@@ -1168,16 +1315,25 @@ def main():
         )
         gerar_audio = st.checkbox("🔊 Gerar áudio didático das respostas", value=True)
 
+        # --- Operacoes pesadas: exigem chave PROPRIA validada ---
         if st.button("▶️ Explicar aula atual", type="primary", use_container_width=True):
-            with st.spinner("O professor está preparando a aula..."):
-                ss["historico"], audio = acao_iniciar_aula(
-                    ss["historico"], ss["estado"], chave, gerar_audio, usar_visual
-                )
-            _guardar_audio(audio)
+            if not chave_propria_valida(chave):
+                st.error(MSG_CHAVE_OBRIGATORIA)
+            else:
+                with st.spinner("O professor está preparando a aula..."):
+                    ss["historico"], audio = acao_iniciar_aula(
+                        ss["historico"], ss["estado"], chave.strip(), gerar_audio, usar_visual
+                    )
+                _guardar_audio(audio)
 
         if st.button("✅ Concluir aula e avançar", use_container_width=True):
-            with st.spinner("Gerando resumo da aula..."):
-                ss["historico"] = acao_concluir_aula(ss["historico"], ss["estado"], chave, usar_visual)
+            if not chave_propria_valida(chave):
+                st.error(MSG_CHAVE_OBRIGATORIA)
+            else:
+                with st.spinner("Gerando resumo da aula..."):
+                    ss["historico"] = acao_concluir_aula(
+                        ss["historico"], ss["estado"], chave.strip(), usar_visual
+                    )
 
         if st.button("🔄 Reiniciar curso", use_container_width=True):
             ss["historico"] = acao_reiniciar_curso(ss["historico"], ss["estado"])
@@ -1191,15 +1347,18 @@ def main():
 
     prompt = st.chat_input("Digite sua dúvida ou sua resolução (Cálculo, Física, Circuitos, Estruturas...)")
     if prompt:
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        with st.chat_message("assistant"):
-            with st.spinner("O professor está pensando..."):
-                ss["historico"], audio = responder_usuario(
-                    prompt, ss["historico"], ss["estado"], chave, gerar_audio, usar_visual
-                )
-            st.markdown(ss["historico"][-1]["content"])
-        _guardar_audio(audio)
+        if not chave_propria_valida(chave):
+            st.error(MSG_CHAVE_OBRIGATORIA)
+        else:
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            with st.chat_message("assistant"):
+                with st.spinner("O professor está pensando..."):
+                    ss["historico"], audio = responder_usuario(
+                        prompt, ss["historico"], ss["estado"], chave.strip(), gerar_audio, usar_visual
+                    )
+                st.markdown(ss["historico"][-1]["content"])
+            _guardar_audio(audio)
 
     # ---------------- Slots preenchidos por ultimo (refletem as acoes acima) ----------------
     slot_status.markdown(render_status(ss["estado"]))
