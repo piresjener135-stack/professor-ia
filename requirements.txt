@@ -1,5 +1,5 @@
-streamlit
-google-generativeai
-gtts
-pillow
+streamlit>=1.40
+requests
 pypdf
+pymupdf
+edge-tts
