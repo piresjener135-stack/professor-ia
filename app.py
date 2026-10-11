@@ -11,7 +11,8 @@ Professor IA — Engenharia e Matemática (v13-cloud)
 - Página marcada como notranslate (Chrome não traduz mais a interface)
 - Pasta de trabalho em /tmp (HF: fora de /tmp o disco é somente leitura)
 """
-from _future_ import annotations
+from __future__ import annotations
+
 
 import asyncio
 import base64
