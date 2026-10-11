@@ -1,18 +1,13 @@
 """
-Professor IA — Engenharia e Matemática (v13-cloud)
-- Hugging Face Spaces: sem Ollama (localhost não existe), só Gemini na nuvem
-- Chave lida de GEMINI_API_KEY (Secrets do HF); campo de texto como fallback
-- Tema escuro + quadro negro (giz branco/amarelo)
-- Leitura VISUAL do PDF: SOMENTE a página em foco é renderizada
-- Navegação de páginas (◀️ / ▶️) com cache LRU
+Professor IA - Engenharia e Matematica (v14-streamlit)
+- Compativel com Streamlit Cloud (interface Streamlit, sem Gradio)
+- Somente Gemini na nuvem; chave lida de st.secrets / variavel de ambiente GEMINI_API_KEY
+- Leitura VISUAL do PDF: somente a pagina em foco e renderizada (cache LRU)
 - PDF dividido em 4 aulas progressivas e dependentes
-- TTS DIDÁTICO: roteiro falado como professor na lousa (EDOs com coeficientes A, B e C)
-- Handlers com parâmetros finais OPCIONAIS
-- Página marcada como notranslate (Chrome não traduz mais a interface)
-- Pasta de trabalho em /tmp (HF: fora de /tmp o disco é somente leitura)
+- TTS didatico (edge-tts): roteiro falado como professor na lousa
+- Pasta de trabalho em /tmp (disco do Streamlit Cloud e efemero)
 """
 from __future__ import annotations
-
 
 import asyncio
 import base64
@@ -20,16 +15,15 @@ import io
 import os
 import re
 import shutil
-import sys
+import tempfile
 import threading
 import time
-import traceback
 import uuid
 from collections import OrderedDict
 from pathlib import Path
 
-import gradio as gr
 import requests
+import streamlit as st
 from pypdf import PdfReader, PdfWriter
 
 try:
@@ -45,34 +39,28 @@ except ImportError:
     except ImportError:
         fitz = None
 
-VERSAO = "v13-nuvem"
+VERSAO = "v14-streamlit"
+
+st.set_page_config(
+    page_title=f"Professor IA {VERSAO}",
+    page_icon="🎓",
+    layout="wide",
+)
 
 # ----------------------------------------------------------------------------
-# Diretórios — no HF Spaces, o disco é somente leitura fora de /tmp
+# Diretorios (sempre em /tmp: o disco do app nao e confiavel para escrita)
 # ----------------------------------------------------------------------------
-if os.environ.get("SPACE_ID") or not os.access(Path(_file_).resolve().parent, os.W_OK):
-    BASE = Path("/tmp")
-else:
-    BASE = Path(_file_).resolve().parent
-LIB = BASE / "biblioteca"
-try:
-    LIB.mkdir(parents=True, exist_ok=True)
-except Exception:
-    BASE = Path("/tmp")
-    LIB = BASE / "biblioteca"
-    LIB.mkdir(parents=True, exist_ok=True)
+LIB = Path(tempfile.gettempdir()) / "biblioteca_professor_ia"
+LIB.mkdir(parents=True, exist_ok=True)
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
-
-# Chave do Gemini: lê a variável de ambiente (Secrets do HF)
-CHAVE_ENV = (os.environ.get("GEMINI_API_KEY") or "").strip()
 
 N_AULAS = 4
 LIMITE_AULA_GEMINI = 100_000
 LIMITE_RESUMO = 2_500
 MAX_MENSAGENS_HISTORICO = 8
 
-# --- Leitura visual da página em foco ---
+# --- Leitura visual da pagina em foco ---
 DPI_VISUAL = 110
 QUALIDADE_JPEG = 70
 MAX_LADO_PX = 1400
@@ -112,8 +100,8 @@ PROMPT_SISTEMA = (
     "Ao analisar circuitos em imagens, PRIMEIRO liste componentes e valores legíveis e descreva "
     "a topologia (série, paralelo, mista, malhas, nós) ANTES de calcular. Nunca invente valores "
     "ilegíveis: diga qual não ficou claro e peça confirmação.\n\n"
-    "Se houver contexto de um documento (PDF/aula), baseie-se nele e diga quando algo não estiver disponível "
-    "no texto."
+    "Se houver contexto de um documento (PDF/aula), baseie-se nele e diga quando algo não estiver "
+    "disponível no texto."
 )
 
 PROMPT_RESUMO = (
@@ -123,15 +111,31 @@ PROMPT_RESUMO = (
     "Responda apenas com o resumo."
 )
 
-_cache_modelo_gemini: dict = {}
-_cache_paginas_visual: "OrderedDict[tuple, list]" = OrderedDict()
+
+@st.cache_resource
+def _caches() -> dict:
+    """Caches globais que sobrevivem aos reruns do Streamlit."""
+    return {"modelo": {}, "paginas": OrderedDict()}
+
+
+_cache_modelo_gemini: dict = _caches()["modelo"]
+_cache_paginas_visual: "OrderedDict[tuple, list]" = _caches()["paginas"]
+
+
+def chave_padrao() -> str:
+    """Chave dos Secrets do Streamlit Cloud ou da variavel de ambiente."""
+    try:
+        valor = st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        valor = ""
+    return str(valor or os.environ.get("GEMINI_API_KEY") or "").strip()
 
 
 # ============================================================================
-# MOTOR DE IA — Gemini (Ollama removido: não existe no HF Spaces)
+# MOTOR DE IA - Gemini
 # ============================================================================
 def detectar_modelo_gemini(api_key: str) -> str:
-    """Lista os modelos e escolhe o melhor 'flash' estável para a chave."""
+    """Lista os modelos e escolhe o melhor 'flash' estavel para a chave."""
     if api_key in _cache_modelo_gemini:
         return _cache_modelo_gemini[api_key]
     escolhido = "gemini-2.0-flash"
@@ -178,11 +182,11 @@ def chamar_gemini(pergunta, contexto, historico, api_key, anexos=None):
     """
     Chama o Gemini, opcionalmente com anexos visuais.
     Retorna SEMPRE uma tupla (texto, tipo_de_erro):
-      - (str, "")       -> sucesso
-      - (None, "vazio") -> resposta bloqueada ou sem texto
-      - (None, "http")  -> erro HTTP (401, 403, 429, 500...)
-      - (None, "timeout") -> demorou demais
-      - (None, "rede")  -> erro de conexão
+      (str, "")          -> sucesso
+      (None, "vazio")    -> resposta bloqueada ou sem texto
+      (None, "http")     -> erro HTTP (401, 403, 429, 500...)
+      (None, "timeout")  -> demorou demais
+      (None, "rede")     -> erro de conexao
     """
     modelo = detectar_modelo_gemini(api_key)
     url = f"{GEMINI_BASE}/models/{modelo}:generateContent"
@@ -207,7 +211,7 @@ def chamar_gemini(pergunta, contexto, historico, api_key, anexos=None):
         "systemInstruction": {"parts": [{"text": PROMPT_SISTEMA}]},
         "contents": contents,
     }
-    _t0 = time.perf_counter()
+    t0 = time.perf_counter()
     try:
         r = requests.post(
             url,
@@ -218,7 +222,7 @@ def chamar_gemini(pergunta, contexto, historico, api_key, anexos=None):
         if r.status_code == 404:
             _cache_modelo_gemini.pop(api_key, None)
         r.raise_for_status()
-        print(f"[TEMPO] Gemini respondeu em {time.perf_counter() - _t0:.1f}s")
+        print(f"[TEMPO] Gemini respondeu em {time.perf_counter() - t0:.1f}s")
         res_json = r.json()
         if not (res_json.get("candidates") and res_json["candidates"][0].get("content")):
             return None, "vazio"
@@ -245,19 +249,16 @@ def chamar_gemini(pergunta, contexto, historico, api_key, anexos=None):
 
 
 def motor_hibrido(pergunta, estado, historico, api_key, usar_visual=True):
-    """
-    Versão nuvem: usa SOMENTE Gemini.
-    Se a chave estiver vazia, devolve uma mensagem amigável e não tenta nada.
-    """
+    """Usa SOMENTE Gemini. Retorna (texto, ok, nota)."""
     notas = []
-    chave = (api_key or CHAVE_ENV or "").strip()
+    chave = (api_key or chave_padrao()).strip()
     if not chave:
         return (
-            "⚠️ *Nenhuma chave do Gemini configurada.*\n\n"
-            "*Como resolver:*\n"
-            "• No Space do Hugging Face: vá em *Settings → Variables and secrets* e crie um "
-            "secret chamado GEMINI_API_KEY com a sua chave.\n"
-            "• Ou cole a chave no campo à esquerda e clique em *Testar Chave*.\n\n"
+            "⚠️ **Nenhuma chave do Gemini configurada.**\n\n"
+            "**Como resolver:**\n"
+            "- No Streamlit Cloud: abra *Settings → Secrets* e adicione "
+            "`GEMINI_API_KEY = \"sua-chave\"`.\n"
+            "- Ou cole a chave no campo da barra lateral.\n\n"
             "Obtenha uma chave grátis em: https://aistudio.google.com/app/apikey",
             False,
             "",
@@ -290,8 +291,7 @@ def motor_hibrido(pergunta, estado, historico, api_key, usar_visual=True):
         return ("⚠️ A API do Gemini respondeu com erro. Verifique se a chave está correta e se a "
                 "cota não foi excedida.", False, "")
     if erro == "rede":
-        return ("⚠️ Não consegui falar com a API do Gemini. Verifique a conexão do Space.",
-                False, "")
+        return ("⚠️ Não consegui falar com a API do Gemini. Verifique a conexão.", False, "")
     return ("⚠️ Não consegui obter a resposta do Gemini. Tente novamente em alguns segundos.",
             False, "")
 
@@ -317,22 +317,22 @@ def _indicador_html(cor, texto, detalhe=""):
     )
 
 
-if CHAVE_ENV:
-    INDICADOR_NEUTRO = _indicador_html(
-        "verde",
-        "🟢 Chave compartilhada dos segredos do Hugging Face",
-        "Você também pode colar outra chave no campo acima para substituir temporariamente.",
-    )
-else:
-    INDICADOR_NEUTRO = _indicador_html(
+def indicador_neutro() -> str:
+    if chave_padrao():
+        return _indicador_html(
+            "verde",
+            "🟢 Chave configurada nos Secrets",
+            "Você também pode colar outra chave acima para substituir temporariamente.",
+        )
+    return _indicador_html(
         "cinza",
         "⚪ Nenhuma chave configurada",
-        "Cole a chave no campo acima ou defina o secret GEMINI_API_KEY no Space.",
+        "Cole a chave acima ou defina GEMINI_API_KEY nos Secrets do app.",
     )
 
 
 def testar_chave_gemini(api_key):
-    api_key = (api_key or CHAVE_ENV or "").strip()
+    api_key = (api_key or chave_padrao()).strip()
     if not api_key:
         return _indicador_html("cinza", "⚪ Cole uma chave para testar")
     try:
@@ -344,7 +344,7 @@ def testar_chave_gemini(api_key):
         )
     except requests.RequestException as e:
         return _indicador_html("vermelho", "🔴 Chave inválida / erro de conexão",
-                               f"Sem conexão: {type(e)._name_}")
+                               f"Sem conexão: {type(e).__name__}")
     if r.status_code == 200:
         _cache_modelo_gemini.pop(api_key, None)
         modelo = detectar_modelo_gemini(api_key)
@@ -359,10 +359,10 @@ def testar_chave_gemini(api_key):
 
 
 # ============================================================================
-# PDF — extração de texto e divisão em aulas
+# PDF - extracao de texto e divisao em aulas
 # ============================================================================
 def extrair_paginas_pdf(caminho_pdf):
-    """Somente TEXTO (nunca imagem). PyMuPDF é bem mais rápido que o pypdf."""
+    """Somente TEXTO (nunca imagem). PyMuPDF e bem mais rapido que o pypdf."""
     t0 = time.perf_counter()
     if fitz is not None:
         try:
@@ -445,7 +445,7 @@ def dividir_em_aulas(paginas, n=N_AULAS):
 
 
 # ============================================================================
-# RENDERIZAÇÃO DE UMA PÁGINA (leitura visual)
+# RENDERIZACAO DE UMA PAGINA (leitura visual)
 # ============================================================================
 def _renderizar_uma_pagina(caminho, numero_pagina):
     if fitz is None:
@@ -475,12 +475,10 @@ def _renderizar_uma_pagina(caminho, numero_pagina):
                     colorspace=(fitz.csGRAY if USAR_CINZA else fitz.csRGB),
                     alpha=False,
                 )
-                buf = io.BytesIO()
                 try:
-                    buf.write(pix.tobytes("jpeg", jpg_quality=QUALIDADE_JPEG))
+                    dados = pix.tobytes("jpeg", jpg_quality=QUALIDADE_JPEG)
                 except TypeError:
-                    buf.write(pix.tobytes("jpeg"))
-                dados = buf.getvalue()
+                    dados = pix.tobytes("jpeg")
                 pix = None
                 if len(dados) > MAX_BYTES_PAGINA_VISUAL:
                     raise ValueError(f"JPEG grande demais: {len(dados) // 1024} KB")
@@ -503,7 +501,7 @@ def _renderizar_uma_pagina(caminho, numero_pagina):
 
 
 def _anexos_da_pagina(caminho, numero_pagina):
-    """Lazy: renderiza SÓ esta página, apenas uma vez (cache LRU, inclusive de falhas)."""
+    """Lazy: renderiza SO esta pagina, apenas uma vez (cache LRU, inclusive de falhas)."""
     chave = (caminho, numero_pagina)
     if chave in _cache_paginas_visual:
         _cache_paginas_visual.move_to_end(chave)
@@ -526,8 +524,7 @@ def _anexos_da_pagina(caminho, numero_pagina):
                 anexos = [("application/pdf", dados_pdf, f"[Página {numero_pagina} do material]")]
                 print(f"[PDF] fallback: página {numero_pagina} como PDF ({len(dados_pdf) // 1024} KB).")
             else:
-                print(f"[PDF] fallback pesado ({len(dados_pdf) // 1024} KB): sem imagem. "
-                      "Instale o PyMuPDF (pip install pymupdf).")
+                print(f"[PDF] fallback pesado ({len(dados_pdf) // 1024} KB): sem imagem.")
         except Exception as e:
             print(f"[PDF] falha no fallback da página {numero_pagina}: {e}")
     _cache_paginas_visual[chave] = anexos
@@ -615,7 +612,7 @@ def montar_contexto(estado, limite_texto, visual_desc=""):
 def render_status(estado):
     aulas = estado.get("aulas") or []
     if not aulas:
-        return "📭 *Nenhum PDF carregado.* Envie um PDF para dividi-lo em aulas, ou converse normalmente."
+        return "📭 **Nenhum PDF carregado.** Envie um PDF para dividi-lo em aulas, ou converse normalmente."
     n = len(aulas)
     atual = estado["atual"]
     linhas = []
@@ -626,7 +623,7 @@ def render_status(estado):
             icone = "▶️"
         else:
             icone = "🔒"
-        linhas.append(f"{icone} *Aula {i + 1}* — {a['rotulo']}")
+        linhas.append(f"{icone} **Aula {i + 1}** — {a['rotulo']}")
     if estado["fim"]:
         titulo = f"### 🎉 Curso concluído ({n} de {n} aulas)"
     else:
@@ -634,7 +631,7 @@ def render_status(estado):
     aula = aulas[atual]
     pag_foco = estado.get("pagina_atual") or aula["pag_ini"]
     pag_foco = max(aula["pag_ini"], min(pag_foco, aula["pag_fim"]))
-    foco = f"👁️ *Página em foco:* {pag_foco} (de {aula['pag_ini']}–{aula['pag_fim']} nesta aula)"
+    foco = f"👁️ **Página em foco:** {pag_foco} (de {aula['pag_ini']}–{aula['pag_fim']} nesta aula)"
     notas = [foco]
     tam = len(aula["texto"])
     if tam > LIMITE_AULA_GEMINI:
@@ -645,18 +642,8 @@ def render_status(estado):
     return f"{titulo}\n\n" + "\n\n".join(linhas) + "\n\n" + "\n\n".join(notas)
 
 
-def _caminho_do_arquivo(arquivo):
-    if arquivo is None:
-        return None
-    if isinstance(arquivo, str):
-        return arquivo
-    if isinstance(arquivo, dict):
-        return arquivo.get("path") or arquivo.get("name")
-    return getattr(arquivo, "name", None) or getattr(arquivo, "path", None)
-
-
 # ============================================================================
-# TTS DIDÁTICO — roteiro falado como professor na lousa
+# TTS DIDATICO - roteiro falado como professor na lousa
 # ============================================================================
 _NUM_EXTENSO = {
     "0": "zero", "1": "um", "2": "dois", "3": "três", "4": "quatro",
@@ -694,7 +681,7 @@ def _num_falado(valor):
 
 def _extrair_coeficientes_edo(texto_md):
     """
-    Procura por A·y'' + B·y' + C·y = 0 e devolve os coeficientes.
+    Procura por A*y'' + B*y' + C*y = 0 e devolve os coeficientes.
     Termos ausentes (B ou C) viram zero. Aceita LaTeX (d²y/dx²).
     """
     t = texto_md.replace("$", " ").replace("\\,", " ").replace("\\!", " ")
@@ -732,12 +719,12 @@ def _extrair_coeficientes_edo(texto_md):
         return v
 
     if m.group("a_neg"):
-        A = "-1"
+        a = "-1"
     else:
-        A = _norm(m.group("a_num"), None, forca_um=True)
-    B = "0" if m.group("b_sinal") is None else _norm(m.group("b_num"), m.group("b_sinal"), forca_um=True)
-    C = "0" if m.group("c_sinal") is None else _norm(m.group("c_num"), m.group("c_sinal"), forca_um=True)
-    return {"A": A, "B": B, "C": C, "equacao": equacao_original}
+        a = _norm(m.group("a_num"), None, forca_um=True)
+    b = "0" if m.group("b_sinal") is None else _norm(m.group("b_num"), m.group("b_sinal"), forca_um=True)
+    c = "0" if m.group("c_sinal") is None else _norm(m.group("c_num"), m.group("c_sinal"), forca_um=True)
+    return {"A": a, "B": b, "C": c, "equacao": equacao_original}
 
 
 def _equacao_falada(equacao):
@@ -747,8 +734,7 @@ def _equacao_falada(equacao):
     t = re.sub(r"(?<![A-Za-z])y(?![A-Za-z])", " ípsilon ", t)
     t = t.replace("+", " mais ").replace("-", " menos ")
     t = t.replace("=", " igual a ")
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+    return re.sub(r"\s+", " ", t).strip()
 
 
 def _rotulo_item(texto_md):
@@ -757,13 +743,12 @@ def _rotulo_item(texto_md):
 
 
 def gerar_roteiro_edo(texto_md, coefs):
-    A, B, C = coefs["A"], coefs["B"], coefs["C"]
     equacao_falada = _equacao_falada(coefs["equacao"])
     rotulo = _rotulo_item(texto_md)
     abertura = f"Vamos resolver agora o {rotulo}. " if rotulo else "Vamos resolver agora. "
-    A_fala = _num_falado(A)
-    B_fala = _num_falado(B)
-    C_fala = _num_falado(C)
+    a_fala = _num_falado(coefs["A"])
+    b_fala = _num_falado(coefs["B"])
+    c_fala = _num_falado(coefs["C"])
     return (
         f"{abertura}Temos aqui a equação... {equacao_falada}. "
         "Primeiro, vamos achar os coeficientes A, B e C. "
@@ -773,9 +758,9 @@ def gerar_roteiro_edo(texto_md, coefs):
         "Lembrando que, se algum desses termos não aparecer na equação, "
         "o valor dele será zero. "
         "Observando a nossa equação, temos: "
-        f"o A é igual a... {A_fala}, "
-        f"o B é igual a... {B_fala}, "
-        f"e o C é igual a... {C_fala}. "
+        f"o A é igual a... {a_fala}, "
+        f"o B é igual a... {b_fala}, "
+        f"e o C é igual a... {c_fala}. "
         "Guardando esses três valores, já podemos seguir para o próximo passo da resolução."
     )
 
@@ -783,12 +768,12 @@ def gerar_roteiro_edo(texto_md, coefs):
 def _latex_para_fala(f):
     f = re.sub(r"\\(?:text|mathrm|mathbf)\{([^{}]*)\}", r" \1 ", f)
     for _ in range(3):
-        f = re.sub(r"\\d?frac\{([^{}])\}\{([^{}])\}", r" \1 sobre \2 ", f)
+        f = re.sub(r"\\d?frac\{([^{}]+)\}\{([^{}]+)\}", r" \1 sobre \2 ", f)
     f = re.sub(r"\\sqrt\{([^{}]*)\}", r" raiz quadrada de \1 ", f)
     f = re.sub(r"\^\{?2\}?(?!\w)", " ao quadrado ", f)
     f = re.sub(r"\^\{?3\}?(?!\w)", " ao cubo ", f)
     f = re.sub(r"\^\{([^{}]*)\}|\^(\w)", lambda m: f" elevado a {m.group(1) or m.group(2)} ", f)
-    f = re.sub(r"\{([^{}]*)\}|(\w)", lambda m: f" {m.group(1) or m.group(2)} ", f)
+    f = re.sub(r"\{([^{}]*)\}", r" \1 ", f)
     f = re.sub(r"\\([a-zA-Z]+)", lambda m: _LATEX_PALAVRAS.get(m.group(1), " , "), f)
     f = f.replace("=", " igual a ").replace("+", " mais ").replace("−", " menos ")
     f = re.sub(r"\s-\s", " menos ", f)
@@ -798,7 +783,7 @@ def _latex_para_fala(f):
 
 def _limpar_para_fala_generica(texto):
     """Fallback: limpa markdown, converte LaTeX e insere pausas para soar natural."""
-    t = re.sub(r".*?", " ... trecho de código omitido ... ", texto, flags=re.S)
+    t = re.sub(r"```.*?```", " ... trecho de código omitido ... ", texto, flags=re.S)
     t = re.sub(r"\$\$(.*?)\$\$", lambda m: " ... " + _latex_para_fala(m.group(1)) + " ... ", t, flags=re.S)
     t = re.sub(r"\$([^$\n]+)\$", lambda m: " " + _latex_para_fala(m.group(1)) + ", ", t)
     t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
@@ -832,7 +817,7 @@ def gerar_roteiro_falado(texto_md):
 
 
 def _dividir_texto_fala(texto, limite=LIMITE_BLOCO_TTS):
-    frases = re.split(r"(?<=[.!?;:])\s+|(?<=\.\.\.)\s+", texto)
+    frases = re.split(r"(?<=[.!?;:])\s+", texto)
     blocos = []
     atual = ""
     for f in frases:
@@ -847,7 +832,8 @@ def _dividir_texto_fala(texto, limite=LIMITE_BLOCO_TTS):
         if len(atual) + len(f) + 1 <= limite:
             atual = f"{atual} {f}".strip()
         else:
-            blocos.append(atual)
+            if atual:
+                blocos.append(atual)
             atual = f
     if atual:
         blocos.append(atual)
@@ -885,7 +871,7 @@ async def _sintetizar_blocos(blocos):
 
 def limpar_arquivos_antigos():
     agora = time.time()
-    for padrao, idade in (("resposta_.mp3", IDADE_MAX_ARQUIVOS_SEG), ("curso_.pdf", 24 * 3600)):
+    for padrao, idade in (("resposta_*.mp3", IDADE_MAX_ARQUIVOS_SEG), ("curso_*.pdf", 24 * 3600)):
         for f in LIB.glob(padrao):
             try:
                 if agora - f.stat().st_mtime > idade:
@@ -895,7 +881,7 @@ def limpar_arquivos_antigos():
 
 
 def gerar_audio_resposta(texto):
-    """Gera um único MP3 com a resposta COMPLETA. Retorna (caminho_mp3, mensagem_de_erro)."""
+    """Gera um unico MP3 com a resposta COMPLETA. Retorna (caminho_mp3, mensagem_de_erro)."""
     if edge_tts is None:
         return None, "Áudio indisponível: instale o pacote edge-tts."
     roteiro = gerar_roteiro_falado(texto)
@@ -927,43 +913,15 @@ def gerar_audio_resposta(texto):
 
 
 # ============================================================================
-# HISTÓRICO
+# ACOES (logica pura; a interface Streamlit so chama estas funcoes)
 # ============================================================================
-def _texto_do_conteudo(c):
-    if c is None:
-        return ""
-    if isinstance(c, str):
-        return c
-    if isinstance(c, dict):
-        return str(c.get("text") or c.get("content") or "")
-    if isinstance(c, (list, tuple)):
-        return " ".join(_texto_do_conteudo(x) for x in c).strip()
-    return str(c)
-
-
-def _normalizar_historico(historico):
-    resultado = []
-    for item in historico or []:
-        if isinstance(item, dict):
-            texto = _texto_do_conteudo(item.get("content"))
-            if texto:
-                resultado.append({"role": item["role"], "content": texto})
-        elif isinstance(item, (list, tuple)) and len(item) == 2:
-            usuario, assistente = item
-            if usuario:
-                resultado.append({"role": "user", "content": _texto_do_conteudo(usuario)})
-            if assistente:
-                resultado.append({"role": "assistant", "content": _texto_do_conteudo(assistente)})
-    return resultado
-
-
 def _finalizar_resposta(resposta, ok, nota, gerar_audio):
     caminho_audio = None
     aviso_audio = ""
     if ok and gerar_audio:
-        _t0 = time.perf_counter()
+        t0 = time.perf_counter()
         caminho_audio, erro = gerar_audio_resposta(resposta)
-        print(f"[TEMPO] áudio (TTS) gerado em {time.perf_counter() - _t0:.1f}s")
+        print(f"[TEMPO] áudio (TTS) gerado em {time.perf_counter() - t0:.1f}s")
         if erro:
             aviso_audio = f"🔇 {erro}"
     extras = " ".join(x for x in (nota, aviso_audio) if x)
@@ -971,19 +929,12 @@ def _finalizar_resposta(resposta, ok, nota, gerar_audio):
     return texto_exibido, caminho_audio
 
 
-# ============================================================================
-# AÇÕES DA INTERFACE
-# (parâmetros finais com valor padrão => tolerantes a diferença de entradas)
-# ============================================================================
-def processar_pdf(arquivo_pdf, estado=None, historico=None):
-    historico = _normalizar_historico(historico)
-    estado = _garantir_estado(estado)
+def processar_pdf(caminho, estado):
+    """Le o PDF, divide em aulas e devolve (novo_estado, aviso_ou_vazio)."""
     _descartar_pdf_do_curso(estado)
-    caminho = _caminho_do_arquivo(arquivo_pdf)
     novo = estado_vazio()
-    novo["hist_inicio"] = len(historico)
     if not caminho:
-        return novo, render_status(novo)
+        return novo, ""
     paginas = extrair_paginas_pdf(caminho)
     if not paginas:
         return novo, "⚠️ Não consegui abrir este PDF (arquivo corrompido ou protegido por senha)."
@@ -991,7 +942,7 @@ def processar_pdf(arquivo_pdf, estado=None, historico=None):
     if total < 50:
         return novo, (
             "⚠️ Quase não há texto neste PDF (provavelmente escaneado ou só imagens). "
-            "Ele ainda pode ser lido visualmente, mas a divisão em aulas precisa de algum texto."
+            "A divisão em aulas precisa de algum texto."
         )
     destino = LIB / f"curso_{uuid.uuid4().hex}.pdf"
     try:
@@ -1002,46 +953,42 @@ def processar_pdf(arquivo_pdf, estado=None, historico=None):
     novo["aulas"] = dividir_em_aulas(paginas, N_AULAS)
     novo["nome"] = Path(caminho).name
     novo["pagina_atual"] = novo["aulas"][0]["pag_ini"] if novo["aulas"] else 1
-    return novo, render_status(novo)
+    return novo, ""
 
 
-def navegar_pagina(direcao, estado=None):
-    estado = _garantir_estado(estado)
+def navegar_pagina(direcao, estado):
     aulas = estado.get("aulas") or []
     if not aulas:
-        return estado, render_status(estado)
+        return estado
     aula = aulas[estado["atual"]]
     pag = estado.get("pagina_atual") or aula["pag_ini"]
-    pag = max(aula["pag_ini"], min(pag + direcao, aula["pag_fim"]))
-    estado["pagina_atual"] = pag
-    return estado, render_status(estado)
+    estado["pagina_atual"] = max(aula["pag_ini"], min(pag + direcao, aula["pag_fim"]))
+    return estado
 
 
-def responder_usuario(mensagem, historico=None, estado=None, api_key="", gerar_audio=True, usar_visual=True):
-    historico = _normalizar_historico(historico)
-    estado = _garantir_estado(estado)
-    if not mensagem or not mensagem.strip():
-        return historico, None, ""
+def responder_usuario(mensagem, historico, estado, api_key, gerar_audio=True, usar_visual=True):
+    """Retorna (historico_atualizado, caminho_audio)."""
+    mensagem = (mensagem or "").strip()
+    if not mensagem:
+        return historico, None
     hist_modelo = historico[estado.get("hist_inicio", 0):]
-    resposta, ok, nota = motor_hibrido(mensagem.strip(), estado, hist_modelo, api_key, usar_visual)
+    resposta, ok, nota = motor_hibrido(mensagem, estado, hist_modelo, api_key, usar_visual)
     texto_exibido, caminho_audio = _finalizar_resposta(resposta, ok, nota, gerar_audio)
     historico.append({"role": "user", "content": mensagem})
     historico.append({"role": "assistant", "content": texto_exibido})
-    return historico, caminho_audio, ""
+    return historico, caminho_audio
 
 
-def acao_iniciar_aula(historico=None, estado=None, api_key="", gerar_audio=True, usar_visual=True):
-    historico = _normalizar_historico(historico)
-    estado = _garantir_estado(estado)
+def acao_iniciar_aula(historico, estado, api_key, gerar_audio=True, usar_visual=True):
     if not estado.get("aulas"):
         historico.append({"role": "assistant", "content": "📭 Envie um PDF primeiro para eu montar as aulas."})
-        return historico, None, estado, render_status(estado)
+        return historico, None
     if estado["fim"]:
         historico.append({
             "role": "assistant",
-            "content": "🎉 Você já concluiu todas as aulas. Clique em *🔄 Reiniciar curso* para recomeçar.",
+            "content": "🎉 Você já concluiu todas as aulas. Clique em **🔄 Reiniciar curso** para recomeçar.",
         })
-        return historico, None, estado, render_status(estado)
+        return historico, None
     i = estado["atual"]
     n = len(estado["aulas"])
     pag = estado.get("pagina_atual") or estado["aulas"][i]["pag_ini"]
@@ -1063,18 +1010,16 @@ def acao_iniciar_aula(historico=None, estado=None, api_key="", gerar_audio=True,
     texto_exibido, caminho_audio = _finalizar_resposta(resposta, ok, nota, gerar_audio)
     historico.append({"role": "user", "content": f"▶️ Explicar a Aula {i + 1} de {n} (foco na página {pag})"})
     historico.append({"role": "assistant", "content": texto_exibido})
-    return historico, caminho_audio, estado, render_status(estado)
+    return historico, caminho_audio
 
 
-def acao_concluir_aula(historico=None, estado=None, api_key="", usar_visual=True):
-    historico = _normalizar_historico(historico)
-    estado = _garantir_estado(estado)
+def acao_concluir_aula(historico, estado, api_key, usar_visual=True):
     if not estado.get("aulas"):
         historico.append({"role": "assistant", "content": "📭 Envie um PDF primeiro para eu montar as aulas."})
-        return historico, None, estado, render_status(estado)
+        return historico
     if estado["fim"]:
         historico.append({"role": "assistant", "content": "🎉 O curso já está concluído."})
-        return historico, None, estado, render_status(estado)
+        return historico
     i = estado["atual"]
     n = len(estado["aulas"])
     hist_modelo = historico[estado["hist_inicio"]:]
@@ -1087,284 +1032,185 @@ def acao_concluir_aula(historico=None, estado=None, api_key="", usar_visual=True
         estado["atual"] = i + 1
         estado["pagina_atual"] = estado["aulas"][i + 1]["pag_ini"]
         msg = (
-            f"✅ *Aula {i + 1} concluída!\n\nResumo salvo para as próximas aulas:*\n{resumo}\n\n"
-            f"➡️ Agora você está na *Aula {i + 2} de {n}*. "
-            "Clique em *▶️ Explicar aula atual* quando quiser continuar."
+            f"✅ **Aula {i + 1} concluída!**\n\nResumo salvo para as próximas aulas:\n{resumo}\n\n"
+            f"➡️ Agora você está na **Aula {i + 2} de {n}**. "
+            "Clique em **▶️ Explicar aula atual** quando quiser continuar."
         )
     else:
         estado["fim"] = True
         msg = (
-            f"🎉 *Aula {n} concluída — você terminou todo o material!*\n\n"
-            f"*Resumo da última aula:*\n{resumo}"
+            f"🎉 **Aula {n} concluída — você terminou todo o material!**\n\n"
+            f"Resumo da última aula:\n{resumo}"
         )
     historico.append({"role": "user", "content": f"✅ Concluir a Aula {i + 1}"})
     historico.append({"role": "assistant", "content": msg})
     estado["hist_inicio"] = len(historico)
-    return historico, None, estado, render_status(estado)
+    return historico
 
 
-def acao_reiniciar_curso(historico=None, estado=None):
-    historico = _normalizar_historico(historico)
-    estado = _garantir_estado(estado)
+def acao_reiniciar_curso(historico, estado):
     if not estado.get("aulas"):
-        return historico, None, estado, render_status(estado)
+        return historico
     estado["atual"] = 0
     estado["resumos"] = []
     estado["fim"] = False
     estado["pagina_atual"] = estado["aulas"][0]["pag_ini"]
-    historico.append({"role": "assistant", "content": "🔄 Curso reiniciado. Você está de volta à *Aula 1*."})
+    historico.append({"role": "assistant", "content": "🔄 Curso reiniciado. Você está de volta à **Aula 1**."})
     estado["hist_inicio"] = len(historico)
-    return historico, None, estado, render_status(estado)
+    return historico
 
 
 # ============================================================================
-# INTERFACE GRADIO
+# INTERFACE STREAMLIT
 # ============================================================================
-TEMA = gr.themes.Soft(
-    primary_hue="green",
-    secondary_hue="emerald",
-    neutral_hue="slate",
-).set(
-    body_background_fill="#0b1210",
-    body_background_fill_dark="#0b1210",
-    body_text_color="#e5f5ec",
-    body_text_color_dark="#e5f5ec",
-    block_background_fill="#111c18",
-    block_background_fill_dark="#111c18",
-    input_background_fill="#0e1714",
-    input_background_fill_dark="#0e1714",
-)
-
 CSS = """
-:root, .dark, body, gradio-app, .gradio-container {
-    color-scheme: dark;
+<style>
+html, body, [data-testid="stAppViewContainer"], [data-testid="stSidebar"] {
     background-color: #0b1210 !important;
+    color: #e5f5ec;
 }
-.gradio-container, .gradio-container .main, .gradio-container > .main, .app {
-    max-width: none !important;
-    width: 100% !important;
-}
-.gradio-container { padding-left: 24px !important; padding-right: 24px !important; }
 footer { visibility: hidden; }
-/* ===== QUADRO NEGRO (área de resposta do professor) ===== */
-#quadro-negro {
+/* Quadro negro: mensagens do chat */
+[data-testid="stChatMessage"] {
     background: #0f3b25 !important;
-    border: 8px solid #8b5a2b !important;
-    border-radius: 12px !important;
-    box-shadow: inset 0 0 60px rgba(0,0,0,.55), 0 4px 18px rgba(0,0,0,.6) !important;
-    --body-text-color: #f6faf4;
-    --background-fill-primary: #0f3b25;
-    --background-fill-secondary: #0f3b25;
-    --block-background-fill: #0f3b25;
-    --block-label-background-fill: #0b2d1c;
-    --block-label-text-color: #ffe9a8;
-    --border-color-primary: #e8efe6;
-    --color-accent-soft: #0b2d1c;
+    border: 3px solid #8b5a2b;
+    border-radius: 12px;
+    box-shadow: inset 0 0 40px rgba(0,0,0,.45);
 }
-#quadro-negro .bubble-wrap,
-#quadro-negro .wrapper,
-#quadro-negro .message-wrap { background: #0f3b25 !important; }
-#quadro-negro .message-content,
-#quadro-negro .prose,
-#quadro-negro .prose *,
-#quadro-negro .katex,
-#quadro-negro .katex * { color: #f6faf4 !important; opacity: 1 !important; }
-#quadro-negro .prose { font-size: 1.08rem !important; line-height: 1.75 !important; }
-#quadro-negro .bot-row {
-    background: #0f3b25 !important;
-    border: 2px solid #e8efe6 !important;
-    border-radius: 10px !important;
-}
-#quadro-negro .user-row {
-    background: #0b2d1c !important;
-    border: 2px dashed #ffe9a8 !important;
-    border-radius: 10px !important;
-}
-#quadro-negro .user-row .prose,
-#quadro-negro .user-row .prose * { color: #ffe9a8 !important; }
-#quadro-negro h1, #quadro-negro h2, #quadro-negro h3, #quadro-negro h4 {
-    color: #ffe9a8 !important;
-    border-bottom: 2px dashed rgba(255,233,168,.6);
-    padding-bottom: 4px;
-}
-#quadro-negro strong { color: #ffffff !important; }
-#quadro-negro hr { border: 0; border-top: 2px solid #e8efe6 !important; }
-#quadro-negro table { border-collapse: collapse; }
-#quadro-negro th, #quadro-negro td { border: 1px solid #cfe3d2 !important; padding: 6px 10px; }
-#quadro-negro code, #quadro-negro pre {
-    background: rgba(255,255,255,.10) !important;
-    border: 1px solid rgba(255,255,255,.35) !important;
-    color: #ffe9a8 !important;
-}
-#quadro-negro a { color: #9fe3b0 !important; }
+[data-testid="stChatMessage"] p,
+[data-testid="stChatMessage"] li,
+[data-testid="stChatMessage"] .katex { color: #f6faf4 !important; font-size: 1.05rem; line-height: 1.7; }
+[data-testid="stChatMessage"] h1,
+[data-testid="stChatMessage"] h2,
+[data-testid="stChatMessage"] h3 { color: #ffe9a8 !important; }
+[data-testid="stChatMessage"] strong { color: #ffffff !important; }
+[data-testid="stChatMessage"] code { color: #ffe9a8 !important; background: rgba(255,255,255,.10) !important; }
+</style>
 """
 
-JS_FORCAR_ESCURO = """
-() => {
-    document.documentElement.classList.add('dark');
-    document.body.classList.add('dark');
-    document.documentElement.setAttribute('translate', 'no');
-    document.documentElement.setAttribute('lang', 'pt-BR');
-    document.body.classList.add('notranslate');
-    if (!document.querySelector('meta[name="google"][content="notranslate"]')) {
-        const m = document.createElement('meta');
-        m.name = 'google';
-        m.content = 'notranslate';
-        document.head.appendChild(m);
-    }
-}
-"""
 
-try:
-    GRADIO_MAJOR = int(gr._version_.split(".")[0])
-except (ValueError, AttributeError):
-    GRADIO_MAJOR = 5
-
-if GRADIO_MAJOR >= 6:
-    BLOCKS_KWARGS = {}
-    LAUNCH_KWARGS = dict(theme=TEMA, css=CSS, js=JS_FORCAR_ESCURO, allowed_paths=[str(LIB)])
-else:
-    BLOCKS_KWARGS = dict(theme=TEMA, css=CSS, js=JS_FORCAR_ESCURO)
-    LAUNCH_KWARGS = dict(allowed_paths=[str(LIB)])
+def inicializar_sessao():
+    st.session_state.setdefault("estado", estado_vazio())
+    st.session_state.setdefault("historico", [])
+    st.session_state.setdefault("audio_atual", None)
+    st.session_state.setdefault("audio_tocar", False)
+    st.session_state.setdefault("indicador", None)
+    st.session_state.setdefault("pdf_id", None)
+    st.session_state.setdefault("aviso_pdf", "")
 
 
-def criar_chatbot():
-    opcoes = dict(
-        label="🎓 Quadro Negro — Resposta do Professor",
-        elem_id="quadro-negro",
-        height="78vh",
-        latex_delimiters=[
-            {"left": "$$", "right": "$$", "display": True},
-            {"left": "$", "right": "$", "display": False},
-        ],
-    )
-    try:
-        return gr.Chatbot(type="messages", **opcoes)
-    except TypeError:
-        return gr.Chatbot(**opcoes)
+def _guardar_audio(caminho):
+    if caminho:
+        st.session_state["audio_atual"] = caminho
+        st.session_state["audio_tocar"] = True
 
 
-def criar_blocos():
-    try:
-        return gr.Blocks(title=f"Professor IA {VERSAO}", fill_width=True, **BLOCKS_KWARGS)
-    except TypeError:
-        return gr.Blocks(title=f"Professor IA {VERSAO}", **BLOCKS_KWARGS)
+def main():
+    inicializar_sessao()
+    ss = st.session_state
+    st.markdown(CSS, unsafe_allow_html=True)
 
-
-app = criar_blocos()
-
-with app:
-    estado = gr.State(estado_vazio())
-
-    gr.Markdown(f"# 🎓 Professor IA — Tutor Universal de Exatas {VERSAO}")
-    gr.Markdown(
-        "Assistente híbrido (Gemini) que ensina *passo a passo*, nunca só a resposta. "
-        "Envie um PDF e estude em 4 aulas progressivas, com leitura visual da *página em foco*. "
-        "O áudio narra como um professor de verdade, com pausas de respiração."
+    st.title(f"🎓 Professor IA — Tutor Universal de Exatas {VERSAO}")
+    st.caption(
+        "Assistente (Gemini) que ensina passo a passo, nunca só a resposta. "
+        "Envie um PDF e estude em 4 aulas progressivas, com leitura visual da página em foco."
     )
 
-    with gr.Row(equal_height=False):
-        with gr.Column(scale=1, min_width=340):
-            chave_gemini = gr.Textbox(
-                label="🔒 Chave de API do Gemini (opcional se definida nos Secrets)",
-                placeholder="Cole sua API Key aqui...",
-                type="password",
-            )
-            indicador_chave = gr.HTML(INDICADOR_NEUTRO)
-            btn_testar = gr.Button("🔑 Testar Chave")
+    # ---------------- Barra lateral ----------------
+    with st.sidebar:
+        chave = st.text_input(
+            "🔒 Chave de API do Gemini (opcional se definida nos Secrets)",
+            type="password",
+            placeholder="Cole sua API Key aqui...",
+        )
+        if st.button("🔑 Testar Chave", use_container_width=True):
+            with st.spinner("Testando chave..."):
+                ss["indicador"] = testar_chave_gemini(chave)
+        st.markdown(ss["indicador"] or indicador_neutro(), unsafe_allow_html=True)
 
-            upload_pdf = gr.File(
-                label="Biblioteca (Upload de PDF de aula/livro)",
-                file_types=[".pdf"],
-            )
-            status_aulas = gr.Markdown(render_status(estado_vazio()))
+        arquivo = st.file_uploader("Biblioteca (upload de PDF de aula/livro)", type=["pdf"])
+        if arquivo is not None:
+            id_arquivo = f"{arquivo.name}:{arquivo.size}"
+            if ss["pdf_id"] != id_arquivo:
+                tmp = LIB / f"upload_{uuid.uuid4().hex}.pdf"
+                tmp.write_bytes(arquivo.getvalue())
+                try:
+                    with st.spinner("Lendo o PDF e montando as aulas..."):
+                        novo, aviso = processar_pdf(str(tmp), ss["estado"])
+                finally:
+                    tmp.unlink(missing_ok=True)
+                novo["nome"] = arquivo.name
+                novo["hist_inicio"] = len(ss["historico"])
+                ss["estado"] = novo
+                ss["aviso_pdf"] = aviso
+                ss["pdf_id"] = id_arquivo
+        elif ss["pdf_id"] is not None:
+            _descartar_pdf_do_curso(ss["estado"])
+            ss["estado"] = estado_vazio()
+            ss["pdf_id"] = None
+            ss["aviso_pdf"] = ""
 
-            with gr.Row():
-                btn_pag_prev = gr.Button("◀️ Página", size="sm")
-                btn_pag_next = gr.Button("Página ▶️", size="sm")
+        if ss["aviso_pdf"]:
+            st.warning(ss["aviso_pdf"])
 
-            with gr.Row():
-                btn_iniciar = gr.Button("▶️ Explicar aula atual", variant="primary")
-                btn_concluir = gr.Button("✅ Concluir aula e avançar")
-            btn_reiniciar = gr.Button("🔄 Reiniciar curso", size="sm")
+        slot_status = st.empty()
 
-            usar_visual = gr.Checkbox(
-                label="👁️ Leitura visual da página em foco",
-                value=True,
-                info="Envia SOMENTE a página em foco como imagem ao Gemini (rápido e econômico).",
-            )
-            gerar_audio = gr.Checkbox(label="🔊 Gerar áudio didático das respostas", value=True)
-            audio_resposta = gr.Audio(
-                label="Explicação em Áudio (narração de professor)",
-                interactive=False,
-                autoplay=True,
-                type="filepath",
-                format="mp3",
-            )
+        c1, c2 = st.columns(2)
+        if c1.button("◀️ Página", use_container_width=True):
+            navegar_pagina(-1, ss["estado"])
+        if c2.button("Página ▶️", use_container_width=True):
+            navegar_pagina(+1, ss["estado"])
 
-        with gr.Column(scale=4, min_width=600):
-            chatbot = criar_chatbot()
-            txt_mensagem = gr.Textbox(
-                label="Sua dúvida ou sua resolução (Cálculo, Física, Circuitos, Estruturas...)",
-                placeholder="Digite sua pergunta aqui e aperte Enter...",
-            )
-            btn_enviar = gr.Button("Enviar", variant="primary")
+        usar_visual = st.checkbox(
+            "👁️ Leitura visual da página em foco",
+            value=True,
+            help="Envia SOMENTE a página em foco como imagem ao Gemini (rápido e econômico).",
+        )
+        gerar_audio = st.checkbox("🔊 Gerar áudio didático das respostas", value=True)
 
-    # --- Testar chave Gemini ---
-    btn_testar.click(fn=testar_chave_gemini, inputs=[chave_gemini], outputs=[indicador_chave])
-    chave_gemini.change(fn=lambda: INDICADOR_NEUTRO, inputs=None, outputs=[indicador_chave])
+        if st.button("▶️ Explicar aula atual", type="primary", use_container_width=True):
+            with st.spinner("O professor está preparando a aula..."):
+                ss["historico"], audio = acao_iniciar_aula(
+                    ss["historico"], ss["estado"], chave, gerar_audio, usar_visual
+                )
+            _guardar_audio(audio)
 
-    # --- PDF -> aulas ---
-    upload_pdf.change(fn=processar_pdf, inputs=[upload_pdf, estado, chatbot], outputs=[estado, status_aulas])
+        if st.button("✅ Concluir aula e avançar", use_container_width=True):
+            with st.spinner("Gerando resumo da aula..."):
+                ss["historico"] = acao_concluir_aula(ss["historico"], ss["estado"], chave, usar_visual)
 
-    # --- Navegação de páginas ---
-    btn_pag_prev.click(fn=lambda e: navegar_pagina(-1, e), inputs=[estado], outputs=[estado, status_aulas])
-    btn_pag_next.click(fn=lambda e: navegar_pagina(+1, e), inputs=[estado], outputs=[estado, status_aulas])
+        if st.button("🔄 Reiniciar curso", use_container_width=True):
+            ss["historico"] = acao_reiniciar_curso(ss["historico"], ss["estado"])
 
-    # --- Chat: 6 entradas / 3 saídas ---
-    entradas_chat = [txt_mensagem, chatbot, estado, chave_gemini, gerar_audio, usar_visual]
-    saidas_chat = [chatbot, audio_resposta, txt_mensagem]
-    btn_enviar.click(fn=responder_usuario, inputs=entradas_chat, outputs=saidas_chat)
-    txt_mensagem.submit(fn=responder_usuario, inputs=entradas_chat, outputs=saidas_chat)
+        slot_audio = st.empty()
 
-    # --- Ações de aula ---
-    saidas_aula = [chatbot, audio_resposta, estado, status_aulas]
-    btn_iniciar.click(
-        fn=acao_iniciar_aula,
-        inputs=[chatbot, estado, chave_gemini, gerar_audio, usar_visual],
-        outputs=saidas_aula,
-    )
-    btn_concluir.click(
-        fn=acao_concluir_aula,
-        inputs=[chatbot, estado, chave_gemini, usar_visual],
-        outputs=saidas_aula,
-    )
-    btn_reiniciar.click(
-        fn=acao_reiniciar_curso,
-        inputs=[chatbot, estado],
-        outputs=saidas_aula,
-    )
+    # ---------------- Area principal: quadro negro ----------------
+    for msg in ss["historico"]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    prompt = st.chat_input("Digite sua dúvida ou sua resolução (Cálculo, Física, Circuitos, Estruturas...)")
+    if prompt:
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        with st.chat_message("assistant"):
+            with st.spinner("O professor está pensando..."):
+                ss["historico"], audio = responder_usuario(
+                    prompt, ss["historico"], ss["estado"], chave, gerar_audio, usar_visual
+                )
+            st.markdown(ss["historico"][-1]["content"])
+        _guardar_audio(audio)
+
+    # ---------------- Slots preenchidos por ultimo (refletem as acoes acima) ----------------
+    slot_status.markdown(render_status(ss["estado"]))
+
+    caminho_audio = ss["audio_atual"]
+    if caminho_audio and Path(caminho_audio).exists():
+        tocar = ss["audio_tocar"]
+        ss["audio_tocar"] = False
+        with slot_audio.container():
+            st.caption("Explicação em áudio (narração de professor)")
+            st.audio(Path(caminho_audio).read_bytes(), format="audio/mp3", autoplay=tocar)
 
 
-# ============================================================================
-# ARRANQUE — compatível com Hugging Face Spaces
-# (sem server_port fixo, sem share; o HF cuida da exposição)
-# ============================================================================
-print("=" * 72)
-print(f"🎓 Professor IA — Tutor Universal de Exatas ({VERSAO})")
-print("=" * 72)
-print(f"  Python     : {sys.version.split()[0]}")
-print(f"  Gradio     : {getattr(gr, '_version_', '?')}")
-print(f"  PyMuPDF    : {'OK' if fitz else 'AUSENTE (pip install pymupdf)'}")
-print(f"  Edge-TTS   : {'OK' if edge_tts else 'AUSENTE (pip install edge-tts)'}")
-print(f"  Biblioteca : {LIB}")
-print(f"  Chave Gemini: {'OK (env)' if CHAVE_ENV else 'ausente — configure no campo ou nos Secrets'}")
-print("=" * 72)
-
-try:
-    app.launch(**LAUNCH_KWARGS)
-except Exception as _e:
-    print("\n----------------------------------------")
-    print(f"[X] ERRO FATAL: {type(e).name_}: {_e}")
-    print("----------------------------------------\n")
-    traceback.print_exc()
+main()
