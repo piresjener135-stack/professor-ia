@@ -1,14 +1,16 @@
 """
-Professor IA - Engenharia e Matematica (v14-st)
+Professor IA - Engenharia e Matematica (v15-st)
 - Versao STREAMLIT: mesma logica, layout e estrutura do v14 (Gradio).
 - Leitura VISUAL do PDF: SOMENTE a pagina em foco e renderizada.
-- Chave do Gemini NUNCA fica hardcoded:
-    * Prioridade 1: st.secrets["GEMINI_API_KEY"]
-    * Prioridade 2: campo type="password" na sidebar
-    * Se nao houver chave em nenhum lugar: st.warning + st.stop()
+- Chave do Gemini NUNCA fica hardcoded (Secrets -> campo password -> st.stop()).
 - TTS DIDATICO: EDOs com coeficientes A, B e C; voz pt-BR-ThalitaNeural.
-- Controle de velocidade do audio via pydub (0.75x / 1.0x / 1.25x / 1.5x).
-- Compatível com Streamlit 1.30+ (sem `use_container_width`).
+
+v15 - CONTROLE DE VELOCIDADE EM CASCATA:
+  Camada 1 (pydub): modifica os BYTES do MP3 com o multiplicador escolhido
+                    (0.75 / 1.0 / 1.25 / 1.5) antes de entregar ao player.
+  Camada 2 (HTML5): player <audio controls> com playbackRate fixado no
+                    multiplicador. Se a Camada 1 falhar, a 2 garante a
+                    velocidade marcada no navegador.
 """
 from __future__ import annotations
 
@@ -30,6 +32,7 @@ from pathlib import Path
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from pypdf import PdfReader, PdfWriter
 
 try:
@@ -50,7 +53,7 @@ except ImportError:
     except ImportError:
         fitz = None
 
-# pydub e' opcional: se nao existir, a velocidade sera aplicada apenas pelo edge-tts
+# Camada 1 da velocidade: pydub + ffmpeg (opcional — fallback na camada HTML)
 try:
     from pydub import AudioSegment
     PYDDUB_OK = True
@@ -58,7 +61,7 @@ except ImportError:
     AudioSegment = None
     PYDDUB_OK = False
 
-VERSAO = "v14-st"
+VERSAO = "v15-st"
 
 # ----------------------------------------------------------------------------
 # Diretorios e configuracoes
@@ -90,7 +93,7 @@ VOZ_EDGE = "pt-BR-ThalitaNeural"
 LIMITE_CARACTERES_AUDIO = 9000
 TAMANHO_PEDACO_GTTS = 350
 
-# As 4 velocidades com seus multiplicadores
+# Multiplicadores exatos por rótulo (usados nas duas camadas)
 VELOCIDADE_OPCOES = {
     "0.75x (Lenta)":        0.75,
     "1.0x (Normal)":        1.00,
@@ -99,7 +102,7 @@ VELOCIDADE_OPCOES = {
 }
 VELOCIDADE_PADRAO = "1.0x (Normal)"
 
-# Mapeamento paralelo pro edge-tts (rate), mantido para compatibilidade
+# Mapeamento paralelo para o `rate` do edge-tts (mantido por compatibilidade)
 MAPA_VELOCIDADE = {
     "0.75x (Lenta)":       "-20%",
     "1.0x (Normal)":       "+0%",
@@ -776,10 +779,10 @@ def _dividir_em_pedacos(texto, tamanho):
 
 
 # ----------------------------------------------------------------------------
-# Núcleo do TTS: agora aceita uma VELOCIDADE (multiplicador 0.75 / 1.0 / 1.25 / 1.5)
+# TTS: geração do MP3 (bytes). Aplicação de velocidade é feita na Camada 1.
 # ----------------------------------------------------------------------------
 def _tts_edge(roteiro, caminho, taxa_velocidade="+0%"):
-    """Voz neural pt-BR (edge-tts). Aceita 'rate' direto do edge-tts."""
+    """Voz neural pt-BR. Aplica `rate` (opcional) do edge-tts."""
     if edge_tts is None:
         raise RuntimeError("edge-tts não instalado")
     if not isinstance(taxa_velocidade, str) or not re.fullmatch(r"[+-]\d+%", taxa_velocidade):
@@ -806,7 +809,7 @@ def _tts_edge(roteiro, caminho, taxa_velocidade="+0%"):
 
 
 def _tts_gtts(roteiro, caminho):
-    """gTTS em pedacos pequenos + novas tentativas. Sem alteração de velocidade (o pydub cuida)."""
+    """Fallback: gTTS em pedaços. Velocidade aplicada depois, pela Camada 1."""
     if gTTS is None:
         raise RuntimeError("gTTS não instalado")
     saida = io.BytesIO()
@@ -834,29 +837,8 @@ def _tts_gtts(roteiro, caminho):
     caminho.write_bytes(dados)
 
 
-def _aplicar_velocidade_pydub(caminho_mp3: Path, multiplicador: float) -> None:
-    """
-    Ajusta a velocidade do MP3 SEM alterar o tom (time-stretch simples).
-    Requer pydub + ffmpeg. Se nao estiver disponivel, nao faz nada.
-    """
-    if not PYDDUB_OK or AudioSegment is None:
-        return
-    if abs(multiplicador - 1.0) < 0.01:
-        return  # velocidade normal: nada a fazer
-    try:
-        som = AudioSegment.from_file(str(caminho_mp3), format="mp3")
-        # pydub aceita speedup com crossfade; como queremos manter o tom,
-        # usamos frame_rate puro (o tom muda levemente, mas e' rapido e nao depende de rubberband)
-        novo_frame = int(som.frame_rate * multiplicador)
-        som_veloz = som._spawn(som.raw_data, overrides={"frame_rate": novo_frame})
-        som_veloz = som_veloz.set_frame_rate(som.frame_rate)
-        som_veloz.export(str(caminho_mp3), format="mp3")
-    except Exception as e:
-        print(f"[pydub] Nao consegui ajustar velocidade: {e}")
-
-
 def _resolver_taxa_velocidade(velocidade):
-    """Converte o rótulo do radio em taxa do edge-tts ('+0%', '+25%' etc.)."""
+    """Rótulo -> taxa edge-tts ('+0%', '+25%' ...)."""
     if isinstance(velocidade, str):
         v = velocidade.strip()
         if v in MAPA_VELOCIDADE:
@@ -867,18 +849,69 @@ def _resolver_taxa_velocidade(velocidade):
 
 
 def _resolver_multiplicador(velocidade):
-    """Converte o rótulo do radio em multiplicador numérico (0.75, 1.0, 1.25, 1.5)."""
+    """Rótulo -> multiplicador numérico (0.75, 1.0, 1.25, 1.5)."""
     if isinstance(velocidade, str) and velocidade.strip() in VELOCIDADE_OPCOES:
         return VELOCIDADE_OPCOES[velocidade.strip()]
     return VELOCIDADE_OPCOES[VELOCIDADE_PADRAO]
 
 
+# ---------------------------------------------------------------------------
+# CAMADA 1 — PROCESSAMENTO REAL DOS BYTES COM PYDUB
+# ---------------------------------------------------------------------------
+def _aplicar_velocidade_bytes(caminho_mp3: Path, multiplicador: float) -> bool:
+    """
+    Camada 1: aplica o multiplicador DIRETAMENTE nos bytes do arquivo MP3.
+    Usa pydub (que por baixo usa ffmpeg).
+
+    Estratégia:
+      - Se multiplicador ≈ 1.0, não faz nada (retorna True - considerado sucesso).
+      - Se multiplicador > 1.0, usa speedup() para acelerar.
+      - Se multiplicador < 1.0, usa o truque de frame_rate (desacelera sem alterar demais o tom).
+
+    Retorna True se aplicou (ou se não precisava aplicar), False se falhou
+    (nesse caso a Camada 2 - HTML playbackRate - assume).
+    """
+    if not PYDDUB_OK or AudioSegment is None:
+        print("[pydub] não disponível - Camada 2 (HTML) vai assumir a velocidade.")
+        return False
+    if abs(multiplicador - 1.0) < 0.01:
+        return True  # velocidade normal, nada a fazer
+
+    try:
+        original = AudioSegment.from_file(str(caminho_mp3), format="mp3")
+
+        if multiplicador > 1.0:
+            # Acelerar: pydub faz isso bem com speedup()
+            segmento = original.speedup(playback_speed=multiplicador, chunk_size=150, crossfade=25)
+        else:
+            # Desacelerar: speedup() não aceita <1.0, então usamos frame_rate.
+            # Reduzir o frame_rate torna a reprodução mais lenta.
+            novo_frame = int(original.frame_rate * multiplicador)
+            segmento = original._spawn(
+                original.raw_data,
+                overrides={"frame_rate": novo_frame},
+            ).set_frame_rate(original.frame_rate)
+
+        # Exporta os bytes alterados de volta para o mesmo arquivo
+        segmento.export(str(caminho_mp3), format="mp3", bitrate="128k")
+        print(f"[pydub] Camada 1 aplicada: {multiplicador:.2f}x")
+        return True
+
+    except Exception as e:
+        print(f"[pydub] Camada 1 falhou ({type(e).__name__}: {e}); "
+              f"a Camada 2 (HTML playbackRate) vai assumir.")
+        return False
+
+
 def gerar_audio_resposta(texto, velocidade=VELOCIDADE_PADRAO):
     """
-    Gera o MP3 com a resposta na velocidade escolhida.
-    - Se edge-tts estiver disponível: aplica o `rate` e, se pydub estiver ok,
-      reaplica o multiplicador exato para casar com o rótulo escolhido.
-    - Fallback: gTTS + pydub (aplicando o multiplicador).
+    Pipeline de geração:
+      1) Gera o MP3 base (edge-tts -> gTTS).
+      2) CAMADA 1: aplica a velocidade via pydub (bytes do arquivo).
+      3) Devolve o caminho do MP3 (já alterado, se pydub conseguiu).
+      4) CAMADA 2: o player HTML, na interface, aplica playbackRate = multiplicador.
+
+    Retorna (caminho_mp3, mensagem_de_erro).
     """
     roteiro = gerar_roteiro_falado(texto)
     if not roteiro:
@@ -897,13 +930,68 @@ def gerar_audio_resposta(texto, velocidade=VELOCIDADE_PADRAO):
     for nome, funcao in tentativas:
         try:
             funcao(roteiro, caminho)
-            # Aplica o multiplicador exato (ex.: 1.25) via pydub. Se ausente, no-op.
-            _aplicar_velocidade_pydub(caminho, multiplicador)
+            # CAMADA 1 — processamento real dos bytes
+            _aplicar_velocidade_bytes(caminho, multiplicador)
             return str(caminho), ""
         except Exception as e:
             erros.append(f"{nome}: {type(e).__name__}: {str(e)[:120]}")
             caminho.unlink(missing_ok=True)
     return None, "Falha no áudio; a resposta está no texto. (" + " | ".join(erros) + ")"
+
+
+# ---------------------------------------------------------------------------
+# CAMADA 2 — PLAYER HTML COM playbackRate
+# ---------------------------------------------------------------------------
+def player_html(caminho_mp3: str, multiplicador: float, autoplay: bool = True) -> str:
+    """
+    Renderiza o MP3 em um <audio controls> com playbackRate fixado.
+    Fallback da Camada 1: mesmo se o pydub não alterou os bytes,
+    o navegador força a reprodução na velocidade escolhida.
+
+    Parâmetros:
+      caminho_mp3: caminho absoluto do arquivo no servidor.
+      multiplicador: 0.75, 1.0, 1.25 ou 1.5.
+      autoplay: se True, tenta iniciar automaticamente.
+    """
+    p = Path(caminho_mp3)
+    if not p.exists():
+        return '<p style="color:#ffe9a8">Nenhum áudio disponível.</p>'
+
+    # Lê os bytes e embute em base64 (o componente HTML roda em iframe isolado,
+    # então não há como acessar arquivos do servidor por caminho relativo)
+    dados = p.read_bytes()
+    b64 = base64.b64encode(dados).decode("ascii")
+    src = f"data:audio/mp3;base64,{b64}"
+
+    autoplay_attr = "autoplay" if autoplay else ""
+    # playbackRate é aplicado via JS assim que o elemento carregar
+    html = f"""
+    <div style="background:#0f3b25;border:6px solid #8b5a2b;border-radius:10px;
+                padding:12px;color:#f6faf4;box-shadow:inset 0 0 40px rgba(0,0,0,.5)">
+      <div style="font-weight:600;color:#ffe9a8;margin-bottom:6px">
+        🔊 Reprodução — velocidade {multiplicador:.2f}x
+      </div>
+      <audio id="audioPlayer" controls {autoplay_attr}
+             style="width:100%;background:#0b2d1c;border-radius:8px">
+        <source src="{src}" type="audio/mpeg">
+        Seu navegador não suporta áudio HTML5.
+      </audio>
+      <div style="font-size:0.8em;opacity:0.85;margin-top:6px">
+        ℹ️ A velocidade é forçada pelo player, mesmo se o arquivo original sair em 1.0x.
+      </div>
+      <script>
+        (function() {{
+          const a = document.getElementById("audioPlayer");
+          const rate = {multiplicador};
+          a.addEventListener("loadedmetadata", function() {{ a.playbackRate = rate; }});
+          a.addEventListener("play", function() {{ a.playbackRate = rate; }});
+          a.playbackRate = rate;
+          try {{ a.load(); }} catch (e) {{}}
+        }})();
+      </script>
+    </div>
+    """
+    return html
 
 
 # ----------------------------------------------------------------------------
@@ -1034,6 +1122,8 @@ if "historico" not in st.session_state:
     st.session_state.historico = []
 if "audio_path" not in st.session_state:
     st.session_state.audio_path = None
+if "audio_velocidade" not in st.session_state:
+    st.session_state.audio_velocidade = VELOCIDADE_OPCOES[VELOCIDADE_PADRAO]
 if "status_msg" not in st.session_state:
     st.session_state.status_msg = ""
 
@@ -1051,9 +1141,7 @@ st.markdown(
 with st.sidebar:
     st.header("🔒 Configurações")
 
-    # ---- Chave de API: NUNCA fica hardcoded ------------------------------
-    # Prioridade 1: Secrets do Streamlit
-    # Prioridade 2: campo type="password" na sidebar (usuário digita)
+    # ---- Chave de API: NUNCA hardcoded ------------------------------------
     chave_secrets = ""
     try:
         chave_secrets = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
@@ -1062,13 +1150,11 @@ with st.sidebar:
 
     if chave_secrets:
         st.success("🟢 Chave carregada das Secrets do Streamlit", icon="🔑")
-        # Se o usuário quiser, pode sobrescrever na sessão (não fica salvo)
         chave_digitada = st.text_input(
             "Chave de API do Gemini (opcional — substitui a das Secrets)",
             value="",
             type="password",
             placeholder="Deixe em branco para usar a chave das Secrets",
-            help="Por segurança, esta chave NÃO é salva no código — só vale nesta sessão.",
         )
         chave_gemini = chave_digitada.strip() or chave_secrets
     else:
@@ -1078,23 +1164,19 @@ with st.sidebar:
             value="",
             type="password",
             placeholder="Cole sua chave aqui...",
-            help="Por segurança, esta chave NÃO é salva no código — só vale nesta sessão.",
         )
         chave_gemini = chave_digitada.strip()
 
-    # Se não houver chave em nenhum lugar -> aviso + parada
     if not chave_gemini:
         st.warning(
             "⚠️ **Chave da API do Gemini não informada.**\n\n"
             "**Como resolver:**\n"
             "• Cole a chave no campo acima, **ou**\n"
             "• No Streamlit Cloud, vá em **Settings → Secrets** e crie "
-            "`GEMINI_API_KEY = \"sua_chave\"`.\n\n"
-            "Obtenha uma chave grátis em: https://aistudio.google.com/app/apikey"
+            "`GEMINI_API_KEY = \"sua_chave\"`."
         )
         st.stop()
 
-    # Botão de teste (só aparece se houver chave)
     if st.button("🔑 Testar Chave"):
         with st.spinner("Testando..."):
             _ = listar_modelos_gemini(chave_gemini)
@@ -1178,13 +1260,20 @@ with st.sidebar:
     )
     gerar_audio = st.checkbox("🔊 Gerar áudio didático das respostas", value=True)
 
-    # ---- Controle dinâmico de velocidade: 4 opções ligadas ao TTS --------
+    # Rótulo escolhido no rádio
     velocidade_audio = st.radio(
         "⚡ Velocidade da Voz",
         options=list(VELOCIDADE_OPCOES.keys()),
         index=1,
-        help="Ajuste o ritmo da explicação do professor (0.75x a 1.5x).",
+        help="Ajuste o ritmo (0.75x a 1.5x). O áudio é processado pelo pydub e o player "
+             "HTML reforça a velocidade escolhida.",
     )
+
+    # Mostra se a Camada 1 está disponível
+    if PYDDUB_OK:
+        st.caption("🟢 Camada 1 (pydub) ativa — o arquivo já sai na velocidade escolhida.")
+    else:
+        st.caption("🟡 Camada 1 (pydub) indisponível — o player HTML vai forçar a velocidade.")
 
 
 # ============================================================================
@@ -1206,8 +1295,17 @@ with col_chat:
 
 with col_audio:
     st.markdown("**🔊 Áudio**")
+    # ---- Camada 2: player HTML com playbackRate --------------------------
     if st.session_state.audio_path and Path(st.session_state.audio_path).exists():
-        st.audio(st.session_state.audio_path, format="audio/mp3", autoplay=True)
+        multiplicador = st.session_state.get(
+            "audio_velocidade", VELOCIDADE_OPCOES[VELOCIDADE_PADRAO]
+        )
+        html_player = player_html(
+            st.session_state.audio_path,
+            multiplicador=multiplicador,
+            autoplay=True,
+        )
+        components.html(html_player, height=170)
     else:
         st.caption("Nenhum áudio gerado ainda.")
 
@@ -1219,7 +1317,9 @@ with col_audio:
             )
         if caminho:
             st.session_state.audio_path = caminho
+            st.session_state.audio_velocidade = VELOCIDADE_OPCOES[velocidade_audio]
             st.success(f"🟢 Áudio gerado na velocidade: {velocidade_audio}.")
+            st.rerun()
         else:
             st.error(f"🔴 {erro}")
 
@@ -1310,6 +1410,7 @@ elif acao == "iniciar":
         st.session_state.historico.append({"role": "assistant", "content": texto_exibido})
         if caminho_audio:
             st.session_state.audio_path = caminho_audio
+            st.session_state.audio_velocidade = VELOCIDADE_OPCOES[velocidade_audio]
         st.rerun()
 
 
@@ -1327,4 +1428,5 @@ if pergunta:
     st.session_state.historico.append({"role": "assistant", "content": texto_exibido})
     if caminho_audio:
         st.session_state.audio_path = caminho_audio
+        st.session_state.audio_velocidade = VELOCIDADE_OPCOES[velocidade_audio]
     st.rerun()
