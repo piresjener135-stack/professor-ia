@@ -6,6 +6,7 @@ Professor IA - Engenharia e Matematica (v14-st)
 - Chave do Gemini lida de st.secrets (Streamlit Cloud) ou do campo.
 - TTS DIDATICO: EDOs com coeficientes A, B e C; voz pt-BR-ThalitaNeural.
 - Controle de velocidade da voz (0.75x a 1.5x).
+- Compatível com Streamlit 1.30+ (sem `use_container_width`).
 """
 from __future__ import annotations
 
@@ -50,7 +51,7 @@ except ImportError:
 VERSAO = "v14-st"
 
 # ----------------------------------------------------------------------------
-# Diretorios e configuracoes (mesma logica do Gradio, adaptada a /tmp)
+# Diretorios e configuracoes
 # ----------------------------------------------------------------------------
 BASE = Path(tempfile.gettempdir()) / "professor_ia"
 LIB = BASE / "biblioteca"
@@ -88,9 +89,6 @@ MAPA_VELOCIDADE = {
 VELOCIDADE_PADRAO = "1.0x (Normal)"
 
 
-# ----------------------------------------------------------------------------
-# Chave do Gemini: tenta st.secrets, depois variável de ambiente
-# ----------------------------------------------------------------------------
 def _chave_dos_secrets() -> str:
     """Le GEMINI_API_KEY dos Secrets do Streamlit Cloud (fallback: env var)."""
     try:
@@ -138,7 +136,6 @@ PROMPT_RESUMO = (
     "Responda apenas com o resumo."
 )
 
-# ---- Caches em memoria (iguais ao v14) -------------------------------------
 _cache_modelo_gemini: dict = {}
 _cache_modelo_gemini_expira: dict = {}
 _cache_paginas_visual: "OrderedDict[tuple, list]" = OrderedDict()
@@ -150,7 +147,7 @@ def _id_cache_chave(api_key: str) -> str:
 
 
 # ----------------------------------------------------------------------------
-# Motores de IA (LOGICA IDENTICA AO v14 - so mudou o wrapper)
+# Motores de IA
 # ----------------------------------------------------------------------------
 def _prioridade_modelo_gemini(nome: str) -> tuple:
     baixo = nome.lower()
@@ -348,7 +345,7 @@ def motor_hibrido(pergunta, estado, historico, api_key, usar_visual=True):
 
 
 # ----------------------------------------------------------------------------
-# PDF (LOGICA IDENTICA AO v14)
+# PDF
 # ----------------------------------------------------------------------------
 def extrair_paginas_pdf(caminho_pdf):
     if fitz is not None:
@@ -569,7 +566,7 @@ def montar_contexto(estado, limite_texto, visual_desc=""):
 
 
 # ============================================================================
-# TTS DIDATICO (LOGICA IDENTICA AO v14)
+# TTS DIDATICO
 # ============================================================================
 _NUM_EXTENSO = {
     "0": "zero", "1": "um", "2": "dois", "3": "três", "4": "quatro",
@@ -861,7 +858,7 @@ def gerar_audio_resposta(texto, velocidade=VELOCIDADE_PADRAO):
 
 
 # ----------------------------------------------------------------------------
-# Historico e acoes (logica identica ao v14, adaptada ao fluxo do Streamlit)
+# Historico e acoes
 # ----------------------------------------------------------------------------
 def _normalizar_historico(historico):
     resultado = []
@@ -884,7 +881,6 @@ def _finalizar_resposta(resposta, ok, nota, gerar_audio, velocidade=VELOCIDADE_P
 
 
 def _processar_upload(arquivo, estado_atual):
-    """Faz o papel do antigo processar_pdf (mesma logica)."""
     if arquivo is None:
         return estado_atual, ""
     _descartar_pdf_do_curso(estado_atual)
@@ -912,7 +908,7 @@ def _processar_upload(arquivo, estado_atual):
 
 
 # ============================================================================
-# INTERFACE STREAMLIT — mesmo layout e estrutura do Gradio
+# INTERFACE STREAMLIT
 # ============================================================================
 st.set_page_config(
     page_title=f"Professor IA {VERSAO}",
@@ -921,7 +917,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# CSS — o mesmo quadro negro, tema escuro e notranslate do v14
 st.markdown("""
 <meta name="google" content="notranslate">
 <style>
@@ -964,7 +959,6 @@ footer { visibility: hidden; }
 }
 .quadro-negro a { color: #9fe3b0 !important; }
 
-/* bloco do professor: giz branco com borda definida */
 .professor-bloco {
     background: #0f3b25 !important;
     border: 2px solid #e8efe6 !important;
@@ -973,7 +967,6 @@ footer { visibility: hidden; }
     margin: 8px 0;
     color: #f6faf4 !important;
 }
-/* bloco do aluno: giz amarelo tracejado */
 .aluno-bloco {
     background: #0b2d1c !important;
     border: 2px dashed #ffe9a8 !important;
@@ -986,11 +979,10 @@ footer { visibility: hidden; }
 """, unsafe_allow_html=True)
 
 
-# ---- Estados de sessão (substituem o gr.State) ------------------------------
 if "estado" not in st.session_state:
     st.session_state.estado = estado_vazio()
 if "historico" not in st.session_state:
-    st.session_state.historico = []      # [{"role","content"}]
+    st.session_state.historico = []
 if "audio_path" not in st.session_state:
     st.session_state.audio_path = None
 if "status_msg" not in st.session_state:
@@ -1005,12 +997,11 @@ st.markdown(
 )
 
 # ============================================================================
-# PAINEL LATERAL (equivalente ao gr.Column(scale=1, min_width=340))
+# PAINEL LATERAL
 # ============================================================================
 with st.sidebar:
     st.header("🔒 Configurações")
 
-    # Chave do Gemini: pré-preenchida pelo Secret (mas editável)
     if CHAVE_ENV:
         st.success("🟢 Chave carregada das Secrets do Streamlit", icon="🔑")
         chave_gemini = st.text_input(
@@ -1028,8 +1019,7 @@ with st.sidebar:
             help="Cole sua chave. No Streamlit Cloud, prefira definir o Secret GEMINI_API_KEY.",
         )
 
-    # Testar chave
-    if st.button("🔑 Testar Chave", use_container_width=True):
+    if st.button("🔑 Testar Chave"):
         with st.spinner("Testando..."):
             _ = listar_modelos_gemini(chave_gemini.strip())
             modelo = detectar_modelo_gemini(chave_gemini.strip())
@@ -1040,7 +1030,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Upload de PDF
     upload_pdf = st.file_uploader(
         "Biblioteca (Upload de PDF de aula/livro)",
         type=["pdf"],
@@ -1054,7 +1043,6 @@ with st.sidebar:
             st.session_state.estado = novo
             st.success(f"📚 PDF '{upload_pdf.name}' carregado em {len(novo['aulas'])} aulas.")
 
-    # Status
     _estado = _garantir_estado(st.session_state.estado)
     if not _estado["aulas"]:
         st.caption("📭 Nenhum PDF carregado.")
@@ -1077,10 +1065,9 @@ with st.sidebar:
 
     st.divider()
 
-    # Navegação de páginas
     col_prev, col_next = st.columns(2)
     with col_prev:
-        if st.button("◀ Página", use_container_width=True):
+        if st.button("◀ Página"):
             e = _garantir_estado(st.session_state.estado)
             if e["aulas"]:
                 aula = e["aulas"][e["atual"]]
@@ -1088,7 +1075,7 @@ with st.sidebar:
                 e["pagina_atual"] = max(aula["pag_ini"], min(pag - 1, aula["pag_fim"]))
                 st.session_state.estado = e
     with col_next:
-        if st.button("Página ▶", use_container_width=True):
+        if st.button("Página ▶"):
             e = _garantir_estado(st.session_state.estado)
             if e["aulas"]:
                 aula = e["aulas"][e["atual"]]
@@ -1096,20 +1083,18 @@ with st.sidebar:
                 e["pagina_atual"] = max(aula["pag_ini"], min(pag + 1, aula["pag_fim"]))
                 st.session_state.estado = e
 
-    # Ações de aula
     col_i, col_c = st.columns(2)
     with col_i:
-        if st.button("▶️ Explicar aula", variant="primary", use_container_width=True):
+        if st.button("▶️ Explicar aula", type="primary"):
             st.session_state["_acao"] = "iniciar"
     with col_c:
-        if st.button("✅ Concluir aula", use_container_width=True):
+        if st.button("✅ Concluir aula"):
             st.session_state["_acao"] = "concluir"
-    if st.button("🔄 Reiniciar curso", use_container_width=True):
+    if st.button("🔄 Reiniciar curso"):
         st.session_state["_acao"] = "reiniciar"
 
     st.divider()
 
-    # Opções
     usar_visual = st.checkbox(
         "👁️ Leitura visual da página em foco",
         value=True,
@@ -1125,14 +1110,13 @@ with st.sidebar:
 
 
 # ============================================================================
-# ÁREA CENTRAL: QUADRO NEGRO + CHAT + ÁUDIO
+# ÁREA CENTRAL
 # ============================================================================
 col_chat, col_audio = st.columns([4, 1])
 
 with col_chat:
     st.markdown("**🧑‍🏫 Quadro Negro — Resposta do Professor**")
 
-    # Renderiza o histórico com a estética do quadro negro
     for msg in st.session_state.historico:
         classe = "aluno-bloco" if msg["role"] == "user" else "professor-bloco"
         icone = "🧑‍🎓" if msg["role"] == "user" else "🧑‍🏫"
@@ -1149,7 +1133,7 @@ with col_audio:
     else:
         st.caption("Nenhum áudio gerado ainda.")
 
-    if st.button("🔊 Testar áudio", use_container_width=True):
+    if st.button("🔊 Testar áudio"):
         with st.spinner("Gerando áudio de teste..."):
             caminho, erro = gerar_audio_resposta(
                 "Olá! Eu sou a sua professora. Se você está me ouvindo, o áudio está funcionando.",
@@ -1251,7 +1235,6 @@ elif acao == "iniciar":
         st.rerun()
 
 
-# ---- Entrada do chat --------------------------------------------------------
 pergunta = st.chat_input("Digite sua dúvida ou cole sua resolução...")
 
 if pergunta:
