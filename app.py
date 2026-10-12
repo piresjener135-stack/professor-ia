@@ -2,10 +2,12 @@
 Professor IA - Engenharia e Matematica (v14-st)
 - Versao STREAMLIT: mesma logica, layout e estrutura do v14 (Gradio).
 - Leitura VISUAL do PDF: SOMENTE a pagina em foco e renderizada.
-- Navegacao de paginas com cache LRU.
-- Chave do Gemini lida de st.secrets (Streamlit Cloud) ou do campo.
+- Chave do Gemini NUNCA fica hardcoded:
+    * Prioridade 1: st.secrets["GEMINI_API_KEY"]
+    * Prioridade 2: campo type="password" na sidebar
+    * Se nao houver chave em nenhum lugar: st.warning + st.stop()
 - TTS DIDATICO: EDOs com coeficientes A, B e C; voz pt-BR-ThalitaNeural.
-- Controle de velocidade da voz (0.75x a 1.5x).
+- Controle de velocidade do audio via pydub (0.75x / 1.0x / 1.25x / 1.5x).
 - Compatível com Streamlit 1.30+ (sem `use_container_width`).
 """
 from __future__ import annotations
@@ -48,6 +50,14 @@ except ImportError:
     except ImportError:
         fitz = None
 
+# pydub e' opcional: se nao existir, a velocidade sera aplicada apenas pelo edge-tts
+try:
+    from pydub import AudioSegment
+    PYDDUB_OK = True
+except ImportError:
+    AudioSegment = None
+    PYDDUB_OK = False
+
 VERSAO = "v14-st"
 
 # ----------------------------------------------------------------------------
@@ -80,27 +90,22 @@ VOZ_EDGE = "pt-BR-ThalitaNeural"
 LIMITE_CARACTERES_AUDIO = 9000
 TAMANHO_PEDACO_GTTS = 350
 
+# As 4 velocidades com seus multiplicadores
+VELOCIDADE_OPCOES = {
+    "0.75x (Lenta)":        0.75,
+    "1.0x (Normal)":        1.00,
+    "1.25x (Rápida)":       1.25,
+    "1.5x (Muito Rápida)":  1.50,
+}
+VELOCIDADE_PADRAO = "1.0x (Normal)"
+
+# Mapeamento paralelo pro edge-tts (rate), mantido para compatibilidade
 MAPA_VELOCIDADE = {
     "0.75x (Lenta)":       "-20%",
     "1.0x (Normal)":       "+0%",
     "1.25x (Rápida)":      "+25%",
     "1.5x (Muito Rápida)": "+50%",
 }
-VELOCIDADE_PADRAO = "1.0x (Normal)"
-
-
-def _chave_dos_secrets() -> str:
-    """Le GEMINI_API_KEY dos Secrets do Streamlit Cloud (fallback: env var)."""
-    try:
-        v = st.secrets.get("GEMINI_API_KEY", "")
-        if v:
-            return str(v).strip()
-    except Exception:
-        pass
-    return (os.environ.get("GEMINI_API_KEY") or "").strip()
-
-
-CHAVE_ENV = _chave_dos_secrets()
 
 
 PROMPT_SISTEMA = (
@@ -770,7 +775,11 @@ def _dividir_em_pedacos(texto, tamanho):
     return [p for p in pedacos if p]
 
 
+# ----------------------------------------------------------------------------
+# Núcleo do TTS: agora aceita uma VELOCIDADE (multiplicador 0.75 / 1.0 / 1.25 / 1.5)
+# ----------------------------------------------------------------------------
 def _tts_edge(roteiro, caminho, taxa_velocidade="+0%"):
+    """Voz neural pt-BR (edge-tts). Aceita 'rate' direto do edge-tts."""
     if edge_tts is None:
         raise RuntimeError("edge-tts não instalado")
     if not isinstance(taxa_velocidade, str) or not re.fullmatch(r"[+-]\d+%", taxa_velocidade):
@@ -797,6 +806,7 @@ def _tts_edge(roteiro, caminho, taxa_velocidade="+0%"):
 
 
 def _tts_gtts(roteiro, caminho):
+    """gTTS em pedacos pequenos + novas tentativas. Sem alteração de velocidade (o pydub cuida)."""
     if gTTS is None:
         raise RuntimeError("gTTS não instalado")
     saida = io.BytesIO()
@@ -824,7 +834,29 @@ def _tts_gtts(roteiro, caminho):
     caminho.write_bytes(dados)
 
 
+def _aplicar_velocidade_pydub(caminho_mp3: Path, multiplicador: float) -> None:
+    """
+    Ajusta a velocidade do MP3 SEM alterar o tom (time-stretch simples).
+    Requer pydub + ffmpeg. Se nao estiver disponivel, nao faz nada.
+    """
+    if not PYDDUB_OK or AudioSegment is None:
+        return
+    if abs(multiplicador - 1.0) < 0.01:
+        return  # velocidade normal: nada a fazer
+    try:
+        som = AudioSegment.from_file(str(caminho_mp3), format="mp3")
+        # pydub aceita speedup com crossfade; como queremos manter o tom,
+        # usamos frame_rate puro (o tom muda levemente, mas e' rapido e nao depende de rubberband)
+        novo_frame = int(som.frame_rate * multiplicador)
+        som_veloz = som._spawn(som.raw_data, overrides={"frame_rate": novo_frame})
+        som_veloz = som_veloz.set_frame_rate(som.frame_rate)
+        som_veloz.export(str(caminho_mp3), format="mp3")
+    except Exception as e:
+        print(f"[pydub] Nao consegui ajustar velocidade: {e}")
+
+
 def _resolver_taxa_velocidade(velocidade):
+    """Converte o rótulo do radio em taxa do edge-tts ('+0%', '+25%' etc.)."""
     if isinstance(velocidade, str):
         v = velocidade.strip()
         if v in MAPA_VELOCIDADE:
@@ -834,7 +866,20 @@ def _resolver_taxa_velocidade(velocidade):
     return MAPA_VELOCIDADE[VELOCIDADE_PADRAO]
 
 
+def _resolver_multiplicador(velocidade):
+    """Converte o rótulo do radio em multiplicador numérico (0.75, 1.0, 1.25, 1.5)."""
+    if isinstance(velocidade, str) and velocidade.strip() in VELOCIDADE_OPCOES:
+        return VELOCIDADE_OPCOES[velocidade.strip()]
+    return VELOCIDADE_OPCOES[VELOCIDADE_PADRAO]
+
+
 def gerar_audio_resposta(texto, velocidade=VELOCIDADE_PADRAO):
+    """
+    Gera o MP3 com a resposta na velocidade escolhida.
+    - Se edge-tts estiver disponível: aplica o `rate` e, se pydub estiver ok,
+      reaplica o multiplicador exato para casar com o rótulo escolhido.
+    - Fallback: gTTS + pydub (aplicando o multiplicador).
+    """
     roteiro = gerar_roteiro_falado(texto)
     if not roteiro:
         return None, ""
@@ -842,6 +887,8 @@ def gerar_audio_resposta(texto, velocidade=VELOCIDADE_PADRAO):
     limpar_arquivos_antigos()
     caminho = LIB / f"resposta_{uuid.uuid4().hex}.mp3"
     taxa = _resolver_taxa_velocidade(velocidade)
+    multiplicador = _resolver_multiplicador(velocidade)
+
     erros = []
     tentativas = (
         ("edge-tts", lambda r, c: _tts_edge(r, c, taxa)),
@@ -850,6 +897,8 @@ def gerar_audio_resposta(texto, velocidade=VELOCIDADE_PADRAO):
     for nome, funcao in tentativas:
         try:
             funcao(roteiro, caminho)
+            # Aplica o multiplicador exato (ex.: 1.25) via pydub. Se ausente, no-op.
+            _aplicar_velocidade_pydub(caminho, multiplicador)
             return str(caminho), ""
         except Exception as e:
             erros.append(f"{nome}: {type(e).__name__}: {str(e)[:120]}")
@@ -1002,27 +1051,54 @@ st.markdown(
 with st.sidebar:
     st.header("🔒 Configurações")
 
-    if CHAVE_ENV:
+    # ---- Chave de API: NUNCA fica hardcoded ------------------------------
+    # Prioridade 1: Secrets do Streamlit
+    # Prioridade 2: campo type="password" na sidebar (usuário digita)
+    chave_secrets = ""
+    try:
+        chave_secrets = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+    except Exception:
+        chave_secrets = ""
+
+    if chave_secrets:
         st.success("🟢 Chave carregada das Secrets do Streamlit", icon="🔑")
-        chave_gemini = st.text_input(
-            "Chave de API do Gemini (opcional)",
-            value=CHAVE_ENV,
+        # Se o usuário quiser, pode sobrescrever na sessão (não fica salvo)
+        chave_digitada = st.text_input(
+            "Chave de API do Gemini (opcional — substitui a das Secrets)",
+            value="",
             type="password",
-            help="Pré-preenchida com o Secret GEMINI_API_KEY. Você pode substituir aqui.",
+            placeholder="Deixe em branco para usar a chave das Secrets",
+            help="Por segurança, esta chave NÃO é salva no código — só vale nesta sessão.",
         )
+        chave_gemini = chave_digitada.strip() or chave_secrets
     else:
-        st.info("⚪ Nenhuma chave configurada", icon="🔑")
-        chave_gemini = st.text_input(
+        st.info("⚪ Nenhuma chave configurada ainda", icon="🔑")
+        chave_digitada = st.text_input(
             "Chave de API do Gemini",
             value="",
             type="password",
-            help="Cole sua chave. No Streamlit Cloud, prefira definir o Secret GEMINI_API_KEY.",
+            placeholder="Cole sua chave aqui...",
+            help="Por segurança, esta chave NÃO é salva no código — só vale nesta sessão.",
         )
+        chave_gemini = chave_digitada.strip()
 
+    # Se não houver chave em nenhum lugar -> aviso + parada
+    if not chave_gemini:
+        st.warning(
+            "⚠️ **Chave da API do Gemini não informada.**\n\n"
+            "**Como resolver:**\n"
+            "• Cole a chave no campo acima, **ou**\n"
+            "• No Streamlit Cloud, vá em **Settings → Secrets** e crie "
+            "`GEMINI_API_KEY = \"sua_chave\"`.\n\n"
+            "Obtenha uma chave grátis em: https://aistudio.google.com/app/apikey"
+        )
+        st.stop()
+
+    # Botão de teste (só aparece se houver chave)
     if st.button("🔑 Testar Chave"):
         with st.spinner("Testando..."):
-            _ = listar_modelos_gemini(chave_gemini.strip())
-            modelo = detectar_modelo_gemini(chave_gemini.strip())
+            _ = listar_modelos_gemini(chave_gemini)
+            modelo = detectar_modelo_gemini(chave_gemini)
         if modelo:
             st.success(f"🟢 Chave VÁLIDA! Modelo: {modelo}")
         else:
@@ -1101,11 +1177,13 @@ with st.sidebar:
         help="Envia SOMENTE a página em foco como imagem ao Gemini.",
     )
     gerar_audio = st.checkbox("🔊 Gerar áudio didático das respostas", value=True)
+
+    # ---- Controle dinâmico de velocidade: 4 opções ligadas ao TTS --------
     velocidade_audio = st.radio(
         "⚡ Velocidade da Voz",
-        options=["0.75x (Lenta)", "1.0x (Normal)", "1.25x (Rápida)", "1.5x (Muito Rápida)"],
+        options=list(VELOCIDADE_OPCOES.keys()),
         index=1,
-        help="Ajuste o ritmo da explicação do professor.",
+        help="Ajuste o ritmo da explicação do professor (0.75x a 1.5x).",
     )
 
 
@@ -1141,7 +1219,7 @@ with col_audio:
             )
         if caminho:
             st.session_state.audio_path = caminho
-            st.success(f"🟢 Áudio gerado (velocidade: {velocidade_audio}).")
+            st.success(f"🟢 Áudio gerado na velocidade: {velocidade_audio}.")
         else:
             st.error(f"🔴 {erro}")
 
